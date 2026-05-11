@@ -55,16 +55,19 @@ class Chapter:
             return None
         return str(value)
 
-    def __hash__(self):
-        return hash(
-            (
-                self.chapter_id,
-                self.chapter_number,
-                self.chapter_language,
-                self.manga_id,
-                self.manga_name,
-            )
+    def _identity(self):
+        return (
+            self.chapter_id,
+            self.chapter_number,
+            self.chapter_language,
+            self.manga_id,
+            self.manga_name,
         )
 
+    def __hash__(self):
+        return hash(self._identity())
+
     def __eq__(self, other):
-        return self.__hash__() == other.__hash__()
+        if not isinstance(other, Chapter):
+            return NotImplemented
+        return self._identity() == other._identity()

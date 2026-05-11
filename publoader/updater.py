@@ -1,6 +1,7 @@
 import json
 import logging
 import shutil
+import tarfile
 import time
 from pathlib import Path
 from typing import Tuple
@@ -11,7 +12,7 @@ from github import Github
 from github.Commit import Commit
 
 from publoader.utils.config import config, resources_path
-from publoader.utils.utils import root_path
+from publoader.utils.utils import atomic_write_text, root_path
 from publoader.webhook import PubloaderWebhook
 
 logger = logging.getLogger("publoader")
@@ -24,7 +25,8 @@ class PubloaderUpdater:
         self.update_path.mkdir(parents=True, exist_ok=True)
 
         self.commits_file = resources_path.joinpath(config["Paths"]["commits_path"])
-        self.github = Github(config["Repo"]["github_access_token"])
+        github_token = config["Repo"].get("github_access_token") or None
+        self.github = Github(github_token) if github_token else Github()
         self.local_commits = self._open_commits()
         self.latest_commit_sha = self.local_commits.get("base_repo")
         self.latest_extension_sha = self.local_commits.get("extension_repo")
@@ -58,57 +60,65 @@ class PubloaderUpdater:
                 "extension_private_repo": self.latest_extension_private_sha,
             }
 
-        with open(self.commits_file, "w") as login_file:
-            login_file.write(json.dumps(data, indent=4))
+        atomic_write_text(self.commits_file, json.dumps(data, indent=4))
 
     def _get_latest_commit(self, repo):
         commits = repo.get_commits()
         latest_commit: Commit = commits[0]
         return latest_commit
 
-    def download_file(self, root_path, content_data):
-        file_name = content_data.name
-        file_remote_path = content_data.path
-        file_path = root_path.joinpath(file_remote_path)
-        file_path_parent = file_path.parent
-        file_path_parent.mkdir(parents=True, exist_ok=True)
+    def _extract_tarball(self, archive_url: str, download_path: Path) -> bool:
+        """Stream a tarball and extract its contents (without the wrapper dir)
+        into download_path. Returns True on failure."""
+        download_path.mkdir(parents=True, exist_ok=True)
 
-        download_url = content_data.download_url
-        logger.info(f"Downloading file {file_path}, link: {download_url}")
+        headers = {}
+        token = config["Repo"].get("github_access_token")
+        if token:
+            headers["Authorization"] = f"token {token}"
 
-        response = requests.get(download_url)
-
-        if response.status_code == 200:
-            content = response.content
-            file_path.write_bytes(content)
-            return False
-        return True
-
-    def download_content(self, repo, root_path, current_path, failed_download=False):
-        logger.info(
-            f"Contents path {repo=}, {root_path=}, {current_path=}, {failed_download=}"
-        )
-
-        root_path.mkdir(parents=True, exist_ok=True)
-
-        all_content = repo.get_contents(current_path)
-        root_files = [file for file in all_content if file.type == "file"]
-        directories = [direc for direc in all_content if direc.type == "dir"]
-
-        for file in root_files:
-            failed_download = self.download_file(root_path, file)
-            time.sleep(2)
-
-        for direc in directories:
-            self.download_content(
-                repo=repo,
-                root_path=root_path,
-                current_path=direc.path,
-                failed_download=failed_download,
+        try:
+            response = requests.get(
+                archive_url, headers=headers, stream=True, timeout=120
             )
-            time.sleep(4)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.error(f"Failed to download tarball {archive_url}: {e}")
+            return True
 
-        return failed_download
+        target_root = download_path.resolve()
+        try:
+            with tarfile.open(fileobj=response.raw, mode="r|gz") as tar:
+                for member in tar:
+                    # Skip wrapper "owner-repo-sha/" directory
+                    parts = member.name.split("/", 1)
+                    if len(parts) < 2 or not parts[1]:
+                        continue
+                    member.name = parts[1]
+
+                    # Defend against path traversal in archive entries
+                    candidate = (download_path / member.name).resolve()
+                    try:
+                        candidate.relative_to(target_root)
+                    except ValueError:
+                        logger.warning(
+                            f"Skipping unsafe tarball entry: {member.name}"
+                        )
+                        continue
+
+                    # Drop symlinks/hardlinks that could escape the target dir
+                    if member.issym() or member.islnk():
+                        logger.warning(
+                            f"Skipping link entry in tarball: {member.name}"
+                        )
+                        continue
+
+                    tar.extract(member, download_path)
+        except (tarfile.TarError, OSError) as e:
+            logger.error(f"Failed to extract tarball: {e}")
+            return True
+
+        return False
 
     def fetch_repo(
         self, repo_name, commit_sha_var, download_path
@@ -134,7 +144,14 @@ class PubloaderUpdater:
             title=f"Update found for repo {repo_name}",
             description=f"SHA: `{latest_remote_commit.sha}`",
         ).main()
-        failed_download = self.download_content(repo, download_path, "")
+
+        try:
+            archive_url = repo.get_archive_link("tarball", latest_remote_commit.sha)
+        except github.GithubException as e:
+            logger.exception(f"Couldn't get archive link for {repo_name}: {e}")
+            return False, True, commit_sha_var
+
+        failed_download = self._extract_tarball(archive_url, download_path)
         return True, failed_download, latest_remote_commit.sha
 
     def move_files(self):

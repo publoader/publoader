@@ -55,11 +55,18 @@ class UploaderProcess:
 
         self.upload_retry_total = upload_retry
         self.images_upload_session = 10
-        self.images_to_upload_ids: List[str] = []
+        self.uploaded_image_ids_by_index: Dict[int, str] = {}
         self.images_to_upload_names = {}
         self.upload_session_id: Optional[str] = None
         self.failed_image_upload = False
         self.successful_upload_id: Optional[str] = None
+
+    @property
+    def images_to_upload_ids(self) -> List[str]:
+        return [
+            self.uploaded_image_ids_by_index[i]
+            for i in sorted(self.uploaded_image_ids_by_index)
+        ]
 
     def _images_upload(self, image_batch: Dict[str, bytes]):
         """Upload the images"""
@@ -98,20 +105,23 @@ class UploaderProcess:
             f"{int(image_batch_list[-1]) + 1}."
         )
 
+        self.failed_image_upload = True
         for retry in range(upload_retry):
             successful_upload_data = self._images_upload(image_batch)
 
-            # Add successful image uploads to the image ids array
-            for uploaded_image in successful_upload_data:
-                if successful_upload_data.index(uploaded_image) == 0:
-                    logger.info(f"Success: Uploaded images {successful_upload_data}")
+            if not successful_upload_data:
+                logger.warning("Image upload returned no data, retrying.")
+                continue
 
+            logger.info(f"Success: Uploaded images {successful_upload_data}")
+
+            for uploaded_image in successful_upload_data:
                 uploaded_image_attributes = uploaded_image["attributes"]
                 uploaded_filename = uploaded_image_attributes["originalFileName"]
                 file_size = uploaded_image_attributes["fileSize"]
 
-                self.images_to_upload_ids.insert(
-                    int(uploaded_filename), uploaded_image["id"]
+                self.uploaded_image_ids_by_index[int(uploaded_filename)] = (
+                    uploaded_image["id"]
                 )
                 original_filename = self.images_to_upload_names[uploaded_filename]
 
@@ -126,22 +136,17 @@ class UploaderProcess:
                 )
                 self.failed_image_upload = False
                 break
-            else:
-                # Update the images to upload dictionary with the images that failed
-                image_batch = {
-                    k: v
-                    for (k, v) in image_batch.items()
-                    if k
-                    not in [
-                        i["attributes"]["originalFileName"]
-                        for i in successful_upload_data
-                    ]
-                }
-                logger.warning(
-                    f"Some images didn't upload, retrying. Failed images: {image_batch}"
-                )
-                self.failed_image_upload = True
-                continue
+
+            # Update the images to upload dictionary with the images that failed
+            already_uploaded = {
+                i["attributes"]["originalFileName"] for i in successful_upload_data
+            }
+            image_batch = {
+                k: v for (k, v) in image_batch.items() if k not in already_uploaded
+            }
+            logger.warning(
+                f"Some images didn't upload, retrying. Failed images: {list(image_batch.keys())}"
+            )
 
         return self.failed_image_upload
 
@@ -174,7 +179,7 @@ class UploaderProcess:
             logger.error(e)
         logger.info(f"Sent {session_id} to be deleted.")
 
-    def _delete_exising_upload_session(self):
+    def _delete_existing_upload_session(self):
         """Remove any exising upload sessions to not error out as mangadex only allows one upload session at a time."""
         logger.debug(
             f"Checking for upload sessions for manga {self.mangadex_manga_id}, chapter {self.chapter}."
@@ -203,7 +208,7 @@ class UploaderProcess:
     def _create_upload_session(self) -> Optional[dict]:
         """Try to create an upload session 3 times."""
         try:
-            self._delete_exising_upload_session()
+            self._delete_existing_upload_session()
         except Exception as e:
             logger.error(e)
         else:
@@ -346,7 +351,6 @@ def run(item, http_client, queue_webhook, database_connection, **kwargs):
 
     queue_webhook.add_chapter(item, processed=uploaded)
 
-    database_connection["to_upload"].delete_one({"_id": {"$eq": item["_id"]}})
     if uploaded:
         database_connection["to_upload"].delete_one({"_id": {"$eq": item["_id"]}})
 

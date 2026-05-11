@@ -102,13 +102,14 @@ class MangaUploaderProcess:
         if self.all_manga_chapters is None:
             return
 
+        allowed_languages = set(self.languages) | set(self.custom_language.values())
+        external_urls = {x.chapter_url for x in self.all_manga_chapters}
+
         md_chapters_not_external = [
             c
             for c in self.chapters_on_md
-            if c["attributes"]["translatedLanguage"]
-            not in list(set(self.languages + list(self.custom_language.values())))
-            or c["attributes"]["externalUrl"]
-            not in [x.chapter_url for x in self.all_manga_chapters]
+            if c["attributes"]["translatedLanguage"] not in allowed_languages
+            or c["attributes"]["externalUrl"] not in external_urls
         ]
 
         logger.info(
@@ -285,12 +286,12 @@ class MangaUploaderProcess:
         )
 
         chapters_to_upload = [
-            chapter
-            for chapter in self.updated_chapters
-            if self._check_for_duplicate_chapter_md_list(chapter)["exists"] is False
-            and not self._check_uploaded_different_id(chapter)
+            result["chapter"]
+            for result in chapters_dupe_checker
+            if not result["exists"]
+            and not self._check_uploaded_different_id(result["chapter"])
         ]
-        dupes = [dupe for dupe in chapters_dupe_checker if dupe["exists"] is True]
+        dupes = [result for result in chapters_dupe_checker if result["exists"]]
 
         chapters_to_edit = [
             dupe for dupe in map(self.edit_chapter, dupes) if dupe is not None

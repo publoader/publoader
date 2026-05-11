@@ -92,15 +92,46 @@ _logger = logging.getLogger("publoader")
 
 def clear_old_logs(folder_path: Path):
     for log_file in folder_path.rglob("*.log"):
-        if log_file.stat().st_size < 0:
-            _logger.debug(f"{log_file.name} is empty, deleting.")
-            log_file.unlink()
+        try:
+            stat = log_file.stat()
+        except FileNotFoundError:
             continue
 
-        file_date = datetime.fromtimestamp(log_file.stat().st_mtime).date()
-        if file_date < last_date_keep_logs:
+        # Empty log files: previously gated by `< 0`, which is unreachable.
+        if stat.st_size < 1:
+            _logger.debug(f"{log_file.name} is empty, deleting.")
+            try:
+                log_file.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+
+        if datetime.fromtimestamp(stat.st_mtime).date() < last_date_keep_logs:
             _logger.debug(f"{log_file.name} is over {max_log_days} days old, deleting.")
-            log_file.unlink()
+            try:
+                log_file.unlink()
+            except FileNotFoundError:
+                pass
 
 
 clear_old_logs(logs_root_path)
+
+
+def _attach_error_webhook_handler() -> None:
+    # Imported here to avoid a circular import: webhook.py imports utils.config,
+    # which imports utils.logs only transitively. Calling this after the file
+    # logger setup keeps file-only logs working even if bot/webhook is broken.
+    try:
+        from publoader.webhook import attach_error_webhook_handler
+    except Exception:  # pragma: no cover - best-effort
+        return
+    for name in (
+        "publoader",
+        "publoader-uploader",
+        "publoader-editor",
+        "publoader-deleter",
+    ):
+        attach_error_webhook_handler(name)
+
+
+_attach_error_webhook_handler()

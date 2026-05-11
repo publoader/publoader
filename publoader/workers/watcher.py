@@ -90,10 +90,16 @@ def main(
     table_name: str,
     webhook_colour: str,
     restart_threads: bool,
-    database_connection,
+    database_connection=None,
     **kwargs,
 ):
     """Start the watcher."""
+    if database_connection is None:
+        # Each subprocess gets its own MongoClient — sharing across fork is unsafe.
+        from publoader.models.database import get_database_connection
+
+        database_connection = get_database_connection()
+
     queue_webhook = PubloaderQueueWebhook(
         worker_type=worker_type, colour=webhook_colour
     )
@@ -111,24 +117,28 @@ def main(
     logger.info(f"Starting {worker_type.title()} watcher.")
 
     while True:
+        if not thread.is_alive():
+            if not restart_threads:
+                watcher_worker.kill()
+                break
+            print(f"Restarting {worker_type.title()} Thread")
+            thread = setup_thread(
+                worker_type=worker_type,
+                queue_webhook=queue_webhook,
+                worker_module=worker_module,
+                database_connection=database_connection,
+            )
+
         try:
             with database_connection[table_name].watch(
                 [{"$match": {"operationType": "insert"}}]
             ) as stream:
                 for change in stream:
                     bot_queue.put(change["fullDocument"])
-
-                if not thread.is_alive():
-                    if not restart_threads:
-                        watcher_worker.kill()
-                    else:
-                        print(f"Restarting {worker_type.title()} Thread")
-                        thread = setup_thread(
-                            worker_type=worker_type,
-                            queue_webhook=queue_webhook,
-                            worker_module=worker_module,
-                        )
+                    if not thread.is_alive():
+                        break
         except pymongo.errors.PyMongoError as e:
+            logger.error(f"{worker_type.title()} change-stream error: {e}")
             print(e)
 
     # Block until all tasks are done.

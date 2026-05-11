@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import logging
 import re
@@ -14,6 +15,93 @@ from publoader.webhook import PubloaderWebhook
 
 logger = logging.getLogger("publoader")
 EXTENSION_NAME_REGEX = re.compile(r"^([a-z0-9_]+)$")
+
+# Static checks against the most dangerous footguns. This is not a sandbox —
+# it just refuses to load extensions that *call* these primitives directly.
+# Real isolation needs subprocess/seccomp; the source repos are still trusted.
+_DANGEROUS_CALLS = {
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "os.system",
+    "os.popen",
+    "os.execv",
+    "os.execvp",
+    "os.execve",
+    "os.execvpe",
+    "os.spawnl",
+    "os.spawnv",
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.Popen",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "subprocess.getoutput",
+    "subprocess.getstatusoutput",
+    "ctypes.CDLL",
+    "ctypes.WinDLL",
+    "ctypes.PyDLL",
+    "pty.spawn",
+    "pty.fork",
+}
+_DANGEROUS_IMPORT_ROOTS = {"subprocess", "ctypes", "pty"}
+
+
+def _attr_chain(node: ast.AST) -> Optional[str]:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _scan_python_file(path: Path) -> List[str]:
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+    except (OSError, UnicodeDecodeError, SyntaxError) as e:
+        return [f"{path.name}: could not parse ({e})"]
+
+    issues: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            target = None
+            if isinstance(node.func, ast.Name):
+                target = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                target = _attr_chain(node.func)
+            if target and target in _DANGEROUS_CALLS:
+                issues.append(f"{path.name}:{node.lineno}: dangerous call {target}()")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in _DANGEROUS_IMPORT_ROOTS:
+                    issues.append(
+                        f"{path.name}:{node.lineno}: dangerous import {alias.name!r}"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".", 1)[0]
+            if root in _DANGEROUS_IMPORT_ROOTS:
+                issues.append(
+                    f"{path.name}:{node.lineno}: dangerous from-import {node.module!r}"
+                )
+    return issues
+
+
+def scan_extension_safety(extension_dir: Path) -> List[str]:
+    """Return a list of safety issues for any .py file under extension_dir.
+    An empty list means the static scan found nothing alarming.
+    """
+    issues: List[str] = []
+    for py_file in extension_dir.rglob("*.py"):
+        if "__pycache__" in py_file.parts:
+            continue
+        issues.extend(_scan_python_file(py_file))
+    return issues
 
 
 def validate_list_chapters(list_to_validate, list_elements_type, return_none=False):
@@ -135,8 +223,7 @@ def check_extension_run(
         minute=time_to_run.minute,
         tzinfo=time_to_run.tzinfo,
     )
-    time_to_run_datetime.astimezone(tz=timezone.utc)
-    time_to_run = time_to_run_datetime
+    time_to_run = time_to_run_datetime.astimezone(tz=timezone.utc)
 
     days_to_clean_unsanitised = check_class_has_method(
         extension_name, extension_class, "clean_at"
@@ -198,6 +285,21 @@ def load_extension(extension: Path, clean_db: bool = False, general_run: bool = 
 
     normalised_extension_name = f"extensions.{extension.name}"
     print(f"------Loading {normalised_extension_name}------")
+
+    safety_issues = scan_extension_safety(extension)
+    if safety_issues:
+        formatted = "\n".join(safety_issues)
+        logger.error(
+            f"{normalised_extension_name} failed safety scan, refusing to load:\n{formatted}"
+        )
+        print(f"{normalised_extension_name} failed safety scan, skipping.")
+        PubloaderWebhook(
+            extension_name=normalised_extension_name,
+            title=f"{normalised_extension_name} blocked by safety scan",
+            description=f"Refusing to load. Issues:\n```\n{formatted[:1500]}\n```",
+            colour="FF0000",
+        ).send()
+        return
 
     try:
         spec = importlib.util.spec_from_file_location(

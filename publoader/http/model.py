@@ -11,9 +11,13 @@ from publoader.http.properties import RequestError, http_error_codes
 from publoader.http.response import HTTPResponse
 from publoader.utils.config import config, mangadex_api_url, root_path, upload_retry
 from publoader.utils.singleton import Singleton
+from publoader.utils.utils import atomic_write_text
 
 logger = logging.getLogger("publoader")
 logger_debug = logging.getLogger("debug")
+
+
+DEFAULT_REQUEST_TIMEOUT = 30
 
 
 class HTTPModel(metaclass=Singleton):
@@ -25,6 +29,7 @@ class HTTPModel(metaclass=Singleton):
         self.max_requests = 5
         self.number_of_requests = 0
         self.total_requests = 0
+        self.request_timeout = DEFAULT_REQUEST_TIMEOUT
 
         self.previous_status = 0
         self.total_not_login_row = 0
@@ -109,6 +114,22 @@ class HTTPModel(metaclass=Singleton):
                 loop = False
         return loop
 
+    _SENSITIVE_KEYS = (
+        "password",
+        "client_secret",
+        "refresh_token",
+        "access_token",
+        "authorization",
+    )
+
+    def _redact(self, payload):
+        if not isinstance(payload, dict):
+            return payload
+        return {
+            k: ("***" if k.lower() in self._SENSITIVE_KEYS else v)
+            for k, v in payload.items()
+        }
+
     def _format_request_log(
         self,
         method: "str",
@@ -119,7 +140,13 @@ class HTTPModel(metaclass=Singleton):
         files=None,
         successful_codes: "list" = None,
     ) -> "str":
-        return f'"{method}": {route} {successful_codes=} {params=} {json=} {data=}'
+        safe_data = self._redact(data)
+        safe_json = self._redact(json)
+        safe_params = self._redact(params)
+        return (
+            f'"{method}": {route} {successful_codes=} '
+            f"params={safe_params} json={safe_json} data={safe_data}"
+        )
 
     def _request(
         self,
@@ -158,7 +185,13 @@ class HTTPModel(metaclass=Singleton):
                 run_number += 1
 
                 response = self.session.request(
-                    method, route, json=json, params=params, data=data, files=files
+                    method,
+                    route,
+                    json=json,
+                    params=params,
+                    data=data,
+                    files=files,
+                    timeout=kwargs.get("timeout", self.request_timeout),
                 )
                 logger.debug(
                     f"Initial Request: Code {response.status_code}, URL: {response.url}"
@@ -276,10 +309,10 @@ class HTTPModel(metaclass=Singleton):
 
     def _save_tokens(self, access_token: "str", refresh_token: "str") -> None:
         """Save the access and refresh tokens."""
-        with open(self._token_file, "w") as login_file:
-            login_file.write(
-                json.dumps({"access": access_token, "refresh": refresh_token}, indent=4)
-            )
+        atomic_write_text(
+            self._token_file,
+            json.dumps({"access": access_token, "refresh": refresh_token}, indent=4),
+        )
         logger.debug("Saved mdauth file.")
 
     def _update_headers(self, access_token: "str") -> None:

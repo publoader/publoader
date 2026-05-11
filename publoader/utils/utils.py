@@ -1,13 +1,39 @@
 import datetime
 import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict
 
 logger = logging.getLogger("publoader")
 
 root_path = Path(".")
+
+
+def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Write content to path via temp-file + os.replace so a crash mid-write
+    can never leave a half-written file at the destination."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def open_manga_id_map(manga_map_path: Path) -> dict:

@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from json import JSONDecodeError
 from typing import Dict, List, Optional, Union
@@ -19,6 +20,10 @@ def make_webhook():
 
 webhook = make_webhook()
 COLOUR = "B86F8C"
+
+# Thread-local guard so the error log handler can't recurse into itself when
+# the webhook send path itself logs at ERROR.
+_emit_guard = threading.local()
 
 
 class WebhookHelper:
@@ -101,31 +106,29 @@ class WebhookHelper:
         for c in normalised_chapters:
             embed.add_embed_field(**c)
 
-    def _calculate_embed_size(self, embed: Union[DiscordEmbed, dict]):
-        if isinstance(embed, DiscordEmbed):
-            embed_dict = embed.__dict__
-        else:
-            embed_dict = embed
+    @staticmethod
+    def _embed_as_dict(embed: Union["DiscordEmbed", dict]) -> dict:
+        if isinstance(embed, dict):
+            return embed
+        return dict(embed.__dict__)
 
-        embed_len = len(embed_dict.get("title", "") or "")
-        embed_len += len(embed_dict.get("description", "") or "")
-        if embed_dict.get("footer") is not None:
-            embed_len += len(embed_dict["footer"].get("text", "") or "")
+    def _calculate_embed_size(self, embed: Union[DiscordEmbed, dict]) -> int:
+        embed_dict = self._embed_as_dict(embed)
+        embed_len = len(embed_dict.get("title") or "")
+        embed_len += len(embed_dict.get("description") or "")
+        footer = embed_dict.get("footer") or {}
+        embed_len += len(footer.get("text") or "") if isinstance(footer, dict) else 0
 
-        fields = embed_dict["fields"]
-        embed_len += sum(
-            [
-                len(field.get("name", "") or "") + len(field.get("value", "") or "")
-                for field in fields
-            ]
-        )
+        for field in embed_dict.get("fields") or []:
+            embed_len += len(field.get("name") or "") + len(field.get("value") or "")
         return embed_len
 
-    def _make_multiple_embeds(self, embed: dict, list_fields: List[List[dict]]):
+    def _make_multiple_embeds(self, embed: Union["DiscordEmbed", dict], list_fields: List[List[dict]]):
+        embed_dict = self._embed_as_dict(embed)
         new_embeds = []
         for fields in list_fields:
             new_embed = DiscordEmbed(footer=self.footer)
-            new_embed.__dict__.update(embed)
+            new_embed.__dict__.update(embed_dict)
             new_embed.fields = fields
 
             embed_len = self._calculate_embed_size(new_embed)
@@ -136,19 +139,20 @@ class WebhookHelper:
                 new_embeds.extend(new_embed_split)
         return new_embeds
 
-    def _check_embed_length(self, embed, embed_len):
-        if embed_len >= 6000:
-            num_fields = embed["fields"]
-            splitter = 6
+    def _check_embed_length(self, embed: Union["DiscordEmbed", dict], embed_len: int):
+        if embed_len < 6000:
+            return None
 
-            fields_split = [
-                num_fields[elem : elem + splitter]
-                for elem in range(0, len(num_fields), splitter)
-            ]
+        embed_dict = self._embed_as_dict(embed)
+        num_fields = embed_dict.get("fields") or []
+        splitter = 6
 
-            split_embeds = self._make_multiple_embeds(embed, fields_split)
-            return split_embeds
-        return None
+        fields_split = [
+            num_fields[elem : elem + splitter]
+            for elem in range(0, len(num_fields), splitter)
+        ]
+
+        return self._make_multiple_embeds(embed_dict, fields_split)
 
     def check_embeds_size(self, local_webhook: DiscordWebhook):
         embeds = local_webhook.get_embeds()
@@ -164,32 +168,34 @@ class WebhookHelper:
         if webhook_url is None:
             return
 
-        if local_webhook.embeds:
-            self.check_embeds_size(local_webhook)
+        if not local_webhook.embeds:
+            return
 
-            embeds_split = [
-                local_webhook.embeds[elem : elem + 10]
-                for elem in range(0, len(local_webhook.embeds), 10)
-            ]
-            local_webhook.embeds.clear()
+        self.check_embeds_size(local_webhook)
 
-            for count, embed in enumerate(embeds_split, start=1):
-                local_webhook.embeds = embed
-                response = local_webhook.execute(remove_embeds=True)
-                try:
-                    if isinstance(response, list):
-                        status_codes = [r.status_code for r in response]
-                        messages = [r.json() for r in response]
-                        logger.info(f"Discord API returned: {status_codes}, {messages}")
-                    else:
-                        logger.info(
-                            f"Discord API returned: {response.status_code}, {response.json()}"
-                        )
-                except (JSONDecodeError, AttributeError, KeyError) as e:
-                    logger.error(e)
+        embeds_split = [
+            local_webhook.embeds[elem : elem + 10]
+            for elem in range(0, len(local_webhook.embeds), 10)
+        ]
+        local_webhook.embeds.clear()
 
-                if count < len(embeds_split):
-                    time.sleep(1)
+        for count, embed in enumerate(embeds_split, start=1):
+            local_webhook.embeds = embed
+            response = local_webhook.execute(remove_embeds=True)
+            try:
+                if isinstance(response, list):
+                    status_codes = [r.status_code for r in response]
+                    messages = [r.json() for r in response]
+                    logger.info(f"Discord API returned: {status_codes}, {messages}")
+                else:
+                    logger.info(
+                        f"Discord API returned: {response.status_code}, {response.json()}"
+                    )
+            except (JSONDecodeError, AttributeError, KeyError) as e:
+                logger.error(e)
+
+            if count < len(embeds_split):
+                time.sleep(1)
 
 
 class WebhookBase(WebhookHelper):
@@ -479,6 +485,50 @@ class PubloaderWebhook(WebhookHelper):
     def send(self, **kwargs):
         self.main()
         self.send_webhook()
+
+
+class WebhookLogHandler(logging.Handler):
+    """Logging handler that fires a webhook (or bot notification) on every
+    ERROR-level (or higher) log record. Re-entrancy is guarded so that a
+    failure inside the webhook send path doesn't loop back into itself."""
+
+    def __init__(self, level: int = logging.ERROR):
+        super().__init__(level=level)
+        # Quieter formatter — record content goes inside a code block on Discord.
+        self.setFormatter(
+            logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(_emit_guard, "active", False):
+            return
+        if record.name in ("webhook", "discord_webhook"):
+            return
+        if not webhook_url:
+            return
+        _emit_guard.active = True
+        try:
+            msg = self.format(record)
+            title = f"{record.levelname}: {record.name}"
+            description = f"```\n{msg[:1800]}\n```"
+            PubloaderWebhook(
+                extension_name=None,
+                title=title,
+                description=description,
+                colour="FF0000",
+            ).send()
+        except Exception:
+            self.handleError(record)
+        finally:
+            _emit_guard.active = False
+
+
+def attach_error_webhook_handler(logger_name: str = "publoader") -> None:
+    """Attach the error-firing handler to a logger. Idempotent."""
+    target = logging.getLogger(logger_name)
+    if any(isinstance(h, WebhookLogHandler) for h in target.handlers):
+        return
+    target.addHandler(WebhookLogHandler())
 
 
 if __name__ == "__main__":

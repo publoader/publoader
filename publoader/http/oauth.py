@@ -129,8 +129,16 @@ class OAuth2:
         return self.__client_secret
 
     @staticmethod
-    def __token_expired(token: "str") -> "bool":
-        payload_string = base64.b64decode(token.split(".")[1] + "===").decode("utf-8")
-        expiry_time = json.loads(payload_string)["exp"]
-        current_time = int(time.time())
-        return (expiry_time - current_time) <= 0
+    def __token_expired(token: "Optional[str]") -> "bool":
+        if not token or not isinstance(token, str):
+            return True
+        try:
+            payload_segment = token.split(".")[1]
+        except IndexError:
+            return True
+        try:
+            payload_string = base64.b64decode(payload_segment + "===").decode("utf-8")
+            expiry_time = json.loads(payload_string)["exp"]
+        except (ValueError, KeyError, json.JSONDecodeError):
+            return True
+        return (int(expiry_time) - int(time.time())) <= 0

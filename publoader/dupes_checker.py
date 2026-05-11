@@ -1,5 +1,4 @@
 import logging
-import re
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -51,7 +50,6 @@ class DeleteDuplicatesMD:
             chapters_response = http_client.get(
                 f"{mangadex_api_url}/chapter",
                 params={"ids[]": chapters, "limit": 100, "includes[]": ["manga"]},
-                verify=False,
             )
         except RequestError as e:
             logger.error(e)
@@ -100,17 +98,14 @@ class DeleteDuplicatesMD:
         for chapter in chapters_to_check:
             external_url = chapter["attributes"]["externalUrl"]
 
-            # List of chapters that have similar external url as current element
-            match_list = list(
-                filter(
-                    lambda x: (
-                        x
-                        if re.search(external_url, x["attributes"]["externalUrl"])
-                        else None
-                    ),
-                    not_dupe,
-                )
-            )
+            # Chapters with the *exact* same external url. Using str equality
+            # because the previous regex match treated URLs as patterns, so
+            # dots/slashes silently became metacharacters and matched too much.
+            match_list = [
+                other
+                for other in not_dupe
+                if other["attributes"]["externalUrl"] == external_url
+            ]
 
             # Add both search term and search results to list
             if match_list:
@@ -118,18 +113,11 @@ class DeleteDuplicatesMD:
             else:
                 not_dupe.append(chapter)
 
-        dupes_unique_external_url = set([x["attributes"]["externalUrl"] for x in dupes])
+        dupes_unique_external_url = {x["attributes"]["externalUrl"] for x in dupes}
 
-        # Create sublists of similar external urls
+        # Create sublists of identical external urls
         to_check = [
-            list(
-                filter(
-                    lambda x: (
-                        x if re.search(x["attributes"]["externalUrl"], y) else None
-                    ),
-                    dupes,
-                )
-            )
+            [d for d in dupes if d["attributes"]["externalUrl"] == y]
             for y in dupes_unique_external_url
         ]
 

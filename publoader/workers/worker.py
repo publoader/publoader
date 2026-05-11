@@ -3,8 +3,12 @@ import multiprocessing
 from publoader.workers import watcher
 
 
-def main(database_connection, restart_threads=True):
-    """Initialise watcher processes."""
+def main(database_connection=None, restart_threads=True):
+    """Spawn the watcher subprocesses.
+
+    `database_connection` is intentionally ignored for the children — pymongo's
+    MongoClient is not fork-safe, so each watcher process opens its own.
+    """
     try:
         watchers = [
             {"name": "uploader", "table": "to_upload", "colour": "26D454"},
@@ -19,8 +23,8 @@ def main(database_connection, restart_threads=True):
                     "table_name": worker["table"],
                     "webhook_colour": worker["colour"],
                     "restart_threads": restart_threads,
-                    "database_connection": database_connection,
                 },
+                daemon=True,
             )
             process.start()
     except KeyboardInterrupt:

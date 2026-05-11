@@ -12,3 +12,5 @@ extensions
 .commits
 temp
 .env
+.DS_Store
+publoader/extensions/.*

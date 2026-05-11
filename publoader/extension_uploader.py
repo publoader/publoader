@@ -9,6 +9,7 @@ from publoader.models.database import update_expired_chapter_database
 from publoader.models.dataclasses import Chapter, Manga
 from publoader.utils.config import ratelimit_time, resources_path
 from publoader.utils.misc import format_title, get_md_api
+from publoader.utils.utils import atomic_write_text
 from publoader.webhook import PubloaderNotIndexedWebhook, PubloaderWebhook
 
 logger = logging.getLogger("publoader")
@@ -192,11 +193,10 @@ class ExtensionUploader:
                         {manga_id: {"id": manga_id, "title": manga_title}}
                     )
 
-            with open(
+            atomic_write_text(
                 resources_path.joinpath(self.config["Paths"]["manga_data_path"]),
-                "w",
-            ) as json_file:
-                json.dump(self.manga_data_local, json_file, indent=2)
+                json.dumps(self.manga_data_local, indent=2),
+            )
 
         return self.manga_data_local
 
@@ -275,7 +275,11 @@ class ExtensionUploader:
             ]
 
             logger.info(f"Chapters not indexed: {chapters_not_on_md}")
-            PubloaderNotIndexedWebhook(self.extension_name, chapters_not_on_md).main()
+            PubloaderNotIndexedWebhook(
+                extension_name=self.extension_name,
+                chapters_not_indexed=chapters_not_on_md,
+                chapters_indexed=len(uploaded_chapter_ids) - len(chapters_not_on_md),
+            ).main()
         else:
             logger.info("No uploaded chapter mangadex ids.")
 
@@ -309,7 +313,6 @@ class ExtensionUploader:
             manga_uploader.start_manga_uploading_process(
                 index == len(self.updated_manga_chapters)
             )
-            time.sleep(0.5)
 
         if self.current_uploaded_chapters:
             self._check_all_chapters_uploaded()

@@ -3,13 +3,7 @@ import logging
 import traceback
 from typing import List
 
-import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-
 from publoader.webhook import PubloaderWebhook
-
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-
 from publoader.workers import worker
 from publoader.dupes_checker import DeleteDuplicatesMD
 from publoader.extension_uploader import ExtensionUploader

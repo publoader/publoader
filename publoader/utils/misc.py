@@ -13,19 +13,16 @@ logger = logging.getLogger("publoader")
 
 
 def get_md_api(route: str, **params: dict) -> List[dict]:
-    """Go through each page in the api to get all the chapters/manga."""
-    chapters = []
+    """Page through the MangaDex api and return the combined data array."""
+    chapters: List[dict] = []
     limit = 100
     offset = 0
-    iteration = 0
     retry = 0
     created_at_since_time = "2000-01-01T00:00:00"
-
-    parameters = {}
-    parameters.update(params)
+    first_call = True
+    parameters = dict(params)
 
     while retry < upload_retry:
-        # Update the parameters with the new offset
         parameters.update(
             {
                 "limit": limit,
@@ -36,80 +33,70 @@ def get_md_api(route: str, **params: dict) -> List[dict]:
 
         logger.debug(f"Request parameters: {parameters}")
 
-        # Call the api and get the json data
         try:
-            chapters_response = http_client.get(
-                f"{mangadex_api_url}/{route}", params=parameters, verify=False
+            response = http_client.get(
+                f"{mangadex_api_url}/{route}", params=parameters
             )
         except RequestError as e:
             logger.error(e)
             retry += 1
             continue
 
-        if chapters_response.status_code != 200:
-            manga_response_message = f"Couldn't get the {route}s of the group."
-            logger.error(manga_response_message)
+        if response.status_code != 200 or response.data is None:
+            logger.error(f"Couldn't fetch {route} page (status {response.status_code})")
             retry += 1
             continue
 
-        if chapters_response.data is None:
-            logger.warning(f"Couldn't convert {route}s data into json, retrying.")
-            retry += 1
-            continue
+        page = response.data.get("data") or []
+        chapters.extend(page)
 
-        chapters.extend(chapters_response.data["data"])
-        offset += limit
+        if first_call:
+            pages = math.ceil(response.data.get("total", 0) / limit)
+            logger.debug(f"{pages} page(s) for {route}.")
+            first_call = False
 
-        if iteration == 0:
-            # Finds how many pages needed to be called
-            pages = math.ceil(chapters_response.data.get("total", 0) / limit)
-            logger.debug(f"{pages} page(s) for group {route}s.")
-
-        # End the loop when all the pages have been gone through
-        # Offset 10000 is the highest you can go, reset offset and get next
-        # 10k batch using the last available chapter's created at date
-        if (
-            len(chapters_response.data["data"]) == 0
-            or not chapters_response.data["data"]
-        ):
+        # Empty page => done
+        if not page:
             break
 
-        if offset >= 10000:
-            logger.debug(f"Reached 10k {route}s, looping over next 10k.")
-            created_at_since_time = chapters[-1]["attributes"]["createdAt"].split("+")[
-                0
-            ]
-            offset = 0
-            retry = 0
-            iteration = 0
-            continue
+        offset += limit
 
-        iteration += 1
+        # Mangadex caps offset at 10k. Reset using the last item's createdAt to
+        # walk past the wall.
+        if offset >= 10000:
+            logger.debug(f"Reached 10k {route}s, continuing with createdAtSince cursor.")
+            created_at_since_time = chapters[-1]["attributes"]["createdAt"].split("+")[0]
+            offset = 0
+            first_call = True
+
         retry = 0
 
     return sorted(
         chapters,
-        key=lambda chap_timestamp: datetime.strptime(
-            chap_timestamp["attributes"]["createdAt"], "%Y-%m-%dT%H:%M:%S%z"
+        key=lambda chap: datetime.strptime(
+            chap["attributes"]["createdAt"], "%Y-%m-%dT%H:%M:%S%z"
         ),
     )
 
 
-def iter_aggregate_chapters(aggregate_chapters: dict):
+def iter_aggregate_chapters(aggregate_chapters):
     """Return a generator for each chapter object in the aggregate response."""
-    for volume in aggregate_chapters:
-        if isinstance(aggregate_chapters, dict):
-            volume_iter = aggregate_chapters[volume]["chapters"]
-        elif isinstance(aggregate_chapters, list):
-            volume_iter = volume["chapters"]
+    if isinstance(aggregate_chapters, dict):
+        volumes_iterable = aggregate_chapters.values()
+    elif isinstance(aggregate_chapters, list):
+        volumes_iterable = aggregate_chapters
+    else:
+        return
 
-        for chapter in volume_iter:
-            if isinstance(chapter, str):
-                chapter_iter = volume_iter[chapter]
-            elif isinstance(chapter, dict):
-                chapter_iter = chapter
+    for volume in volumes_iterable:
+        chapters = volume.get("chapters") if isinstance(volume, dict) else None
+        if not chapters:
+            continue
 
-            yield chapter_iter
+        if isinstance(chapters, dict):
+            yield from chapters.values()
+        elif isinstance(chapters, list):
+            yield from chapters
 
 
 def fetch_aggregate(http_client, manga_id: str, **params) -> Optional[dict]:

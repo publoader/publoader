@@ -43,27 +43,25 @@ def update_database(
     database_connection, chapter: Union[list, Union[Chapter, dict]], **kwargs
 ):
     """Update the database with the new chapter."""
-    if isinstance(chapter, Chapter):
-        chapter = vars(chapter)
-
-    chapters = [chapter]
-
     if isinstance(chapter, list):
-        chapters = list(map(convert_model_dict, chapter))
+        chapters = [convert_model_dict(c) for c in chapter]
+    else:
+        chapters = [convert_model_dict(chapter)]
 
     if not chapters:
         print(f"No chapters to update: {chapters}")
         return
 
     for chap in chapters:
-        if "_id" in chap:
-            chap.pop("_id")
+        chap.pop("_id", None)
 
-    null_chapters = list(filter(lambda x: x.get("md_chapter_id") is None, chapters))
-    logger.debug(
-        f"Chapters to insert into database but md_chapter_id is null {null_chapters}"
-    )
-    chapters = list(filter(lambda x: x.get("md_chapter_id") is not None, chapters))
+    null_chapters = [c for c in chapters if c.get("md_chapter_id") is None]
+    if null_chapters:
+        logger.debug(
+            f"Chapters to insert into database but md_chapter_id is null: {null_chapters}"
+        )
+
+    chapters = [c for c in chapters if c.get("md_chapter_id") is not None]
     if not chapters:
         logger.warning("No chapters to add to the database.")
         return

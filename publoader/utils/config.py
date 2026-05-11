@@ -35,9 +35,6 @@ def load_config_info(config: configparser.RawConfigParser):
         logger.info("Manga data path empty, using default.")
         config["Paths"]["manga_data_path"] = "manga_data.json"
 
-    if config["Repo"].get("github_access_token", "") == "":
-        config["Repo"]["github_access_token"] = None
-
     if config["Repo"].get("repo_owner", "") == "":
         config["Repo"]["repo_owner"] = "ArdaxHz"
 
