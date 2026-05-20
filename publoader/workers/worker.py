@@ -14,6 +14,7 @@ def main(database_connection=None, restart_threads=True):
             {"name": "uploader", "table": "to_upload", "colour": "26D454"},
             {"name": "deleter", "table": "to_delete", "colour": "C43542"},
             {"name": "editor", "table": "to_edit", "colour": "FFF71C"},
+            {"name": "unavailable", "table": "to_unavailable", "colour": "9B9B9B"},
         ]
         for worker in watchers:
             process = multiprocessing.Process(

@@ -299,13 +299,16 @@ class HTTPModel(metaclass=Singleton):
         """Open auth file and read saved tokens."""
         try:
             with open(self._token_file, "r") as login_file:
-                token = json.load(login_file)
-            return token
-        except (FileNotFoundError, json.JSONDecodeError):
-            logger.error(
-                "Couldn't find the file, trying to login using your account details."
+                return json.load(login_file)
+        except FileNotFoundError:
+            logger.info(
+                f"No mdauth file at {self._token_file}; will log in with account details."
             )
-            return {}
+        except json.JSONDecodeError:
+            logger.info(
+                f"mdauth file at {self._token_file} is empty/invalid; will log in fresh."
+            )
+        return {}
 
     def _save_tokens(self, access_token: "str", refresh_token: "str") -> None:
         """Save the access and refresh tokens."""

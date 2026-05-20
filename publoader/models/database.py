@@ -215,3 +215,113 @@ def update_expired_chapter_database(
         return
 
     logger.info(f"Deleted {deleted_result.deleted_count} from 'uploaded' collection.")
+
+
+def mark_chapters_unavailable(
+    database_connection,
+    extension_name: str,
+    md_manga_id: str,
+    md_chapter: Union[List[dict], dict] = None,
+    chapter: Union[list, Union[Chapter, dict]] = None,
+    mangadex_manga_data: dict = None,
+    **kwargs,
+):
+    """Mark chapters as no-longer-available on the publisher side.
+
+    Instead of deleting them on MangaDex like update_expired_chapter_database
+    does, these are queued in the `to_unavailable` collection. A dedicated
+    worker (workers/unavailable.py) then strips the externalUrl on the live
+    chapter via the MD API, leaving the pre-uploaded chapter card image as
+    the visible content. After successful processing the row moves into the
+    `unavailable` archive collection (never hard-deleted)."""
+    if md_chapter is None:
+        md_chapter = []
+    if chapter is None:
+        chapter = []
+    if mangadex_manga_data is None:
+        mangadex_manga_data = {}
+
+    if not chapter and not md_chapter:
+        logger.info("No chapters specified to mark unavailable.")
+        return
+
+    if isinstance(chapter, Chapter):
+        chapter = vars(chapter)
+    chapters = [chapter] if not isinstance(chapter, list) else list(
+        map(convert_model_dict, chapter)
+    )
+
+    if isinstance(md_chapter, dict):
+        md_chapter = [md_chapter]
+
+    now = get_current_datetime()
+
+    for chap in chapters:
+        chap["extension_name"] = extension_name
+        chap["unavailable_at"] = now
+
+    if isinstance(md_chapter, list):
+        chapters.extend(
+            [
+                {
+                    "chapter_lookup": now,
+                    "chapter_timestamp": EXPIRE_TIME,
+                    "chapter_language": md_chap["attributes"]["translatedLanguage"],
+                    "chapter_title": md_chap["attributes"]["title"],
+                    "chapter_number": md_chap["attributes"]["chapter"],
+                    "chapter_volume": md_chap["attributes"].get("volume"),
+                    "md_manga_id": md_manga_id,
+                    "md_chapter_id": md_chap["id"],
+                    "chapter_url": md_chap["attributes"]["externalUrl"],
+                    "extension_name": extension_name,
+                    "manga_name": mangadex_manga_data.get(md_manga_id, {}).get("title")
+                    if isinstance(mangadex_manga_data, dict)
+                    else None,
+                    "unavailable_at": now,
+                }
+                for md_chap in md_chapter
+            ]
+        )
+
+    chapters = [c for c in chapters if c.get("md_chapter_id")]
+    if not chapters:
+        logger.info("Nothing to enqueue in to_unavailable (missing md_chapter_id).")
+        return
+
+    try:
+        upsert_result = database_connection["to_unavailable"].bulk_write(
+            [
+                UpdateOne(
+                    {"md_chapter_id": {"$eq": chap["md_chapter_id"]}},
+                    {"$set": chap},
+                    upsert=True,
+                )
+                for chap in chapters
+            ]
+        )
+    except pymongo.errors.BulkWriteError:
+        traceback.print_exc()
+        logger.exception(
+            f"{mark_chapters_unavailable.__name__} raised an error when bulk writing to 'to_unavailable'."
+        )
+        return
+
+    logger.info(
+        f"Queued {upsert_result.upserted_count + upsert_result.modified_count} "
+        "chapters for marking unavailable."
+    )
+
+    # Pull these chapters out of the live `uploaded` collection — the worker
+    # will move them into `unavailable` once the MD-side edit succeeds.
+    try:
+        database_connection["uploaded"].bulk_write(
+            [
+                DeleteOne({"md_chapter_id": {"$eq": chap["md_chapter_id"]}})
+                for chap in chapters
+            ]
+        )
+    except pymongo.errors.BulkWriteError:
+        traceback.print_exc()
+        logger.exception(
+            f"{mark_chapters_unavailable.__name__} raised an error when removing from 'uploaded'."
+        )

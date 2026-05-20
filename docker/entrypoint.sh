@@ -1,15 +1,10 @@
 #!/bin/bash
 set -e
 
-# Cleanup any .mdauth files before running
-echo "Removing any existing .mdauth files..."
-find /app -type f -name "*.mdauth" -exec rm -f {} +
-echo ".mdauth cleanup complete."
-
-# Create a new empty .mdauth file
-echo "Creating fresh /app/.mdauth file..."
-touch /app/.mdauth
-echo "/app/.mdauth file created."
+# /app/.mdauth is bind-mounted from the host for persistence — don't wipe it.
+# Stale tokens are handled by the OAuth refresh path. Just ensure the file
+# exists in case the bind mount is fresh / empty.
+touch /app/.mdauth 2>/dev/null || true
 
 echo "Installing Python dependencies from requirements.txt files..."
 

@@ -5,7 +5,7 @@ import time
 from typing import Dict, List, Optional
 
 from publoader.manga_uploader import MangaUploaderProcess
-from publoader.models.database import update_expired_chapter_database
+from publoader.models.database import mark_chapters_unavailable
 from publoader.models.dataclasses import Chapter, Manga
 from publoader.utils.config import ratelimit_time, resources_path
 from publoader.utils.misc import format_title, get_md_api
@@ -103,7 +103,7 @@ class ExtensionUploader:
         )
         for manga_id in self.chapters_on_md:
             if manga_id in manga_untracked:
-                update_expired_chapter_database(
+                mark_chapters_unavailable(
                     database_connection=self.database_connection,
                     extension_name=self.extension_name,
                     md_chapter=self.chapters_on_md[manga_id],
@@ -149,7 +149,7 @@ class ExtensionUploader:
 
         for manga_id in tracked_ids_no_chapters_md:
             if manga_id in tracked_ids_chapters_md:
-                update_expired_chapter_database(
+                mark_chapters_unavailable(
                     database_connection=self.database_connection,
                     extension_name=self.extension_name,
                     md_chapter=tracked_ids_no_chapters_md[manga_id],

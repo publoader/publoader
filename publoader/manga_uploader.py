@@ -8,10 +8,11 @@ import gridfs.errors
 import pymongo
 from pymongo import UpdateOne
 
+from publoader.chapter_image import generate_chapter_card
 from publoader.http import http_client
 from publoader.models.database import (
+    mark_chapters_unavailable,
     update_database,
-    update_expired_chapter_database,
 )
 from publoader.models.dataclasses import Chapter
 from publoader.utils.misc import (
@@ -117,7 +118,7 @@ class MangaUploaderProcess:
             f"found: {md_chapters_not_external}"
         )
 
-        update_expired_chapter_database(
+        mark_chapters_unavailable(
             database_connection=self.database_connection,
             extension_name=self.extension_name,
             md_chapter=md_chapters_not_external,
@@ -325,24 +326,44 @@ class MangaUploaderProcess:
                 image_filestream = gridfs.GridFS(self.database_connection, "images")
 
                 for chap in chapters_to_insert:
-                    images = []
-                    images_length = 0
-                    if chap["images"] is not None and chap["images"]:
-                        images_length = len(chap["images"])
-                        for index, img in enumerate(chap["images"]):
-                            try:
-                                img_insert_id = image_filestream.put(
-                                    img, filename=index
-                                )
-                                images.append(img_insert_id)
-                            except gridfs.errors.GridFSError as e:
-                                traceback.print_exc()
-                                logger.exception(
-                                    f"{self.start_manga_uploading_process.__name__} raised an error when uploading image for chapter {chap}."
-                                )
-                                break
+                    # Prepend the auto-generated info card so even external
+                    # chapters have at least one page on MD. Lets us strip
+                    # `externalUrl` later (chapter goes unavailable on the
+                    # publisher) without leaving the chapter content-less.
+                    raw_images = list(chap.get("images") or [])
+                    try:
+                        card_bytes = generate_chapter_card(
+                            manga_name=chap.get("manga_name"),
+                            chapter_number=chap.get("chapter_number"),
+                            chapter_title=chap.get("chapter_title"),
+                            chapter_language=chap.get("chapter_language"),
+                            extension_name=chap.get("extension_name"),
+                            chapter_url=chap.get("chapter_url"),
+                        )
+                        raw_images.insert(0, card_bytes)
+                    except Exception:
+                        traceback.print_exc()
+                        logger.exception(
+                            "Failed to generate chapter card; uploading without it."
+                        )
 
-                    chap.pop("images")
+                    images = []
+                    images_length = len(raw_images)
+                    for index, img in enumerate(raw_images):
+                        try:
+                            img_insert_id = image_filestream.put(
+                                img, filename=index
+                            )
+                            images.append(img_insert_id)
+                        except gridfs.errors.GridFSError:
+                            traceback.print_exc()
+                            logger.exception(
+                                f"{self.start_manga_uploading_process.__name__} "
+                                f"raised an error when uploading image for chapter {chap}."
+                            )
+                            break
+
+                    chap.pop("images", None)
                     chap["images"] = images if images_length == len(images) else []
 
                 upload_insertion = self.database_connection["to_upload"].bulk_write(

@@ -1,4 +1,5 @@
 import datetime
+import errno
 import json
 import logging
 import os
@@ -14,7 +15,12 @@ root_path = Path(".")
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     """Write content to path via temp-file + os.replace so a crash mid-write
-    can never leave a half-written file at the destination."""
+    can never leave a half-written file at the destination.
+
+    If the target is a Docker bind-mounted file (rename returns EBUSY because
+    the mount is held by the kernel), fall back to an in-place rewrite. We
+    lose atomicity in that case, but it's the only thing rename() can't do.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -27,13 +33,25 @@ def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
+
+        try:
+            os.replace(tmp_name, path)
+            return
+        except OSError as e:
+            if e.errno not in (errno.EBUSY, errno.EXDEV, errno.EPERM):
+                raise
+            # Bind-mounted or cross-device target — rewrite in place.
+            with open(path, "w", encoding=encoding) as fp:
+                fp.write(content)
+                fp.flush()
+                os.fsync(fp.fileno())
+    finally:
         try:
             os.unlink(tmp_name)
-        except OSError:
+        except FileNotFoundError:
             pass
-        raise
+        except OSError:
+            logger.debug(f"Couldn't clean up temp file {tmp_name}", exc_info=True)
 
 
 def open_manga_id_map(manga_map_path: Path) -> dict:
@@ -57,25 +75,27 @@ def open_title_regex(override_options_path: Path) -> dict:
     try:
         with open(override_options_path, "r") as title_regex_fp:
             override_options = json.load(title_regex_fp)
-    except json.JSONDecodeError as e:
-        logger.critical("Title regex file is corrupted.")
+    except json.JSONDecodeError:
+        logger.error(f"Title regex file is corrupted: {override_options_path}")
         return {}
     except FileNotFoundError:
-        logger.critical("Title regex file is missing.")
+        # Optional file — extensions may have no overrides at all.
+        logger.info(f"No title regex file at {override_options_path}, using empty.")
         return {}
     return override_options
 
 
 def open_manga_data(manga_data_path: Path) -> Dict[str, dict]:
     """Open MangaDex titles data."""
-    manga_data = {}
+    manga_data: Dict[str, dict] = {}
     try:
         with open(manga_data_path, "r") as manga_data_fp:
             manga_data = json.load(manga_data_fp)
-    except json.JSONDecodeError as e:
-        logger.error("Manga data file is corrupted.")
+    except json.JSONDecodeError:
+        logger.error(f"Manga data file is corrupted: {manga_data_path}")
     except FileNotFoundError:
-        logger.error("Manga data file is missing.")
+        # Expected on first run — _get_manga_data_md populates and writes it.
+        logger.info(f"No manga data file at {manga_data_path}, starting empty.")
     return manga_data
 
 

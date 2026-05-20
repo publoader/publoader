@@ -1,18 +1,24 @@
 import argparse
+import configparser
 import json
 import logging
 import os
 import queue
+import re
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from datetime import time as dtTime, timezone
 from importlib import reload
+from pathlib import Path
+from typing import Optional
 
 from scheduler import Scheduler
 
 from publoader.ipc import IPCServer, ipc_call, is_instance_running
+from publoader.state import get_state_store
 from publoader.updater import PubloaderUpdater
 from publoader.utils.config import (
     config,
@@ -20,12 +26,9 @@ from publoader.utils.config import (
     daily_run_time_checks_minute,
     daily_run_time_daily_hour,
     daily_run_time_daily_minute,
-    resources_path,
 )
 from publoader.utils.utils import (
-    atomic_write_text,
     get_current_datetime,
-    open_manga_data,
     root_path,
 )
 from publoader.models.database import get_database_connection
@@ -41,6 +44,32 @@ JOB_RESTART = "restart"
 _ipc_jobs: "queue.Queue" = queue.Queue()
 _run_lock = threading.Lock()
 
+# Extensions currently queued-but-not-yet-completed or actively executing.
+# Used to reject duplicate /run /force / /clean for the same extension while
+# one is in flight, so a re-trigger can't kick off the same extension twice.
+_inflight_extensions: set = set()
+_inflight_lock = threading.Lock()
+
+
+def _claim_extensions(names):
+    """Atomically claim a set of extension names. Returns (accepted, skipped)."""
+    accepted, skipped = [], []
+    with _inflight_lock:
+        for name in names:
+            if name in _inflight_extensions:
+                skipped.append(name)
+            else:
+                _inflight_extensions.add(name)
+                accepted.append(name)
+    return accepted, skipped
+
+
+def _release_extensions(names):
+    if not names:
+        return
+    with _inflight_lock:
+        _inflight_extensions.difference_update(names)
+
 
 def main(
     database_connection,
@@ -52,19 +81,21 @@ def main(
     from publoader import publoader
 
     reload(publoader)
-    with _run_lock:
-        publoader.open_extensions(
-            database_connection,
-            names=extension_names,
-            general_run=general_run,
-            clean_db=clean_db,
-        )
+    try:
+        with _run_lock:
+            publoader.open_extensions(
+                database_connection,
+                names=extension_names,
+                general_run=general_run,
+                clean_db=clean_db,
+            )
+    finally:
+        _release_extensions(extension_names or [])
 
 
-def open_timings():
-    """Open the timings file."""
-    timings = {}
-
+def _open_json_timings() -> dict:
+    """Read every `schedule*.json` under publoader/extensions/."""
+    timings: dict = {}
     for schedule_file in root_path.joinpath("publoader", "extensions").glob(
         "schedule*.json"
     ):
@@ -75,9 +106,35 @@ def open_timings():
     return timings
 
 
+def open_timings() -> dict:
+    """Effective timings: JSON defaults overridden by DB entries (when present).
+
+    Falls back to JSON-only when the state DB file doesn't exist on disk yet —
+    matching the user-stated rule "if a db exists, otherwise just run the
+    default from the timings json".
+    """
+    timings = _open_json_timings()
+    try:
+        store = get_state_store()
+    except sqlite3.Error as e:
+        logger.warning(f"State DB unavailable, using schedule.json only: {e}")
+        return timings
+
+    if not store.exists_on_disk():
+        return timings
+
+    overrides = store.get_schedule_overrides()
+    if not overrides:
+        return timings
+
+    timings.update(overrides)
+    return timings
+
+
 def schedule_extensions(database_connection):
-    """Add the timings to the scheduler."""
-    same = []
+    """Compute timing buckets and register them with the global `schedule`.
+    Returns the bucket list."""
+    same: list = []
     timings = open_timings()
     now = get_current_datetime()
 
@@ -87,10 +144,12 @@ def schedule_extensions(database_connection):
         hour = extension_timings.get("hour", daily_run_time_daily_hour)
         minute = extension_timings.get("minute", daily_run_time_daily_minute)
 
-        if day is not None and day != now.day:
+        # `day` per the extensions-repo contract is day-of-week (0-6, Monday=0).
+        if day is not None and day != now.weekday():
             continue
 
-        # Join extensions to run together if they are scheduled to run within seven minutes of each other
+        # Join extensions to run together if they are scheduled to run within
+        # seven minutes of each other.
         for bucket in same:
             if (
                 hour == bucket["hour"]
@@ -112,12 +171,35 @@ def schedule_extensions(database_connection):
             main,
             weight=1,
             alias=", ".join(fixed_timing["extensions"]),
-            tags=fixed_timing["extensions"],
+            tags=set(fixed_timing["extensions"]),
             kwargs={
                 "database_connection": database_connection,
                 "extension_names": list(fixed_timing["extensions"]),
             },
         )
+    return same
+
+
+def _reschedule_all(database_connection) -> None:
+    """Drop every per-extension job and rebuild from the current effective
+    timings. Called after `/schedule set` or `/schedule remove` so the live
+    scheduler reflects new DB state without a full process restart."""
+    sched = globals().get("schedule")
+    if sched is None:
+        return
+
+    preserved = {"restarter", "daily_checker"}
+    for job in list(getattr(sched, "jobs", [])):
+        tags = getattr(job, "tags", set()) or set()
+        if not (tags & preserved):
+            try:
+                sched.delete_job(job)
+            except Exception:
+                logger.exception(
+                    "Failed to delete a schedule job during reschedule"
+                )
+
+    schedule_extensions(database_connection)
 
 
 def _requirements_satisfied(req_file) -> bool:
@@ -199,6 +281,107 @@ def restart():
     os.execv(sys.executable, [sys.executable, sys.argv[0]])
 
 
+_EXT_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+# Repos that `cmd_pull` knows how to update. Path resolution order:
+#   1. env var (e.g. PUBLOADER_REPO_EXTENSIONS)
+#   2. config.ini [Repos] section (key matches env var minus the prefix, lowercased)
+#   3. a sensible default for the docker layout
+#
+# Each repo entry is (env_var, config_key, default_path).
+_REPO_DEFAULTS: dict = {
+    "base": ("PUBLOADER_REPO_BASE", "base", str(root_path)),
+    "extensions": (
+        "PUBLOADER_REPO_EXTENSIONS",
+        "extensions",
+        str(root_path / "publoader" / "extensions"),
+    ),
+    "extensions-private": (
+        "PUBLOADER_REPO_EXTENSIONS_PRIVATE",
+        "extensions_private",
+        "",  # no default — only resolved if explicitly configured
+    ),
+}
+
+
+def _resolve_repo_path(name: str) -> Optional[Path]:
+    """Return the configured filesystem path for a known repo name, or None."""
+    entry = _REPO_DEFAULTS.get(name)
+    if entry is None:
+        return None
+    env_var, cfg_key, default_path = entry
+
+    raw = os.environ.get(env_var)
+    if not raw:
+        try:
+            raw = config["Repos"].get(cfg_key) if config.has_section("Repos") else None
+        except (KeyError, configparser.NoSectionError):
+            raw = None
+    if not raw:
+        raw = default_path
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
+def _git_pull(repo_path: Path, timeout: int = 60) -> dict:
+    """Run `git pull --ff-only` against repo_path. Returns a serialisable status dict."""
+    def _git(*args, t: int = timeout):
+        return subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            capture_output=True,
+            text=True,
+            timeout=t,
+        )
+
+    try:
+        is_wt = _git("rev-parse", "--is-inside-work-tree", t=10)
+    except FileNotFoundError:
+        return {"ok": False, "error": "git binary not installed"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "git rev-parse timed out"}
+
+    if is_wt.returncode != 0 or is_wt.stdout.strip() != "true":
+        return {
+            "ok": False,
+            "error": (
+                f"{repo_path} is not a git working tree — update via image pull "
+                "(docker compose pull && docker compose up -d) instead."
+            ),
+        }
+
+    try:
+        before = _git("rev-parse", "HEAD", t=10).stdout.strip()
+    except subprocess.TimeoutExpired:
+        before = ""
+
+    try:
+        pull = _git("pull", "--ff-only")
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "git pull timed out"}
+
+    if pull.returncode != 0:
+        return {
+            "ok": False,
+            "error": (pull.stderr.strip() or pull.stdout.strip() or "git pull failed"),
+        }
+
+    try:
+        after = _git("rev-parse", "HEAD", t=10).stdout.strip()
+    except subprocess.TimeoutExpired:
+        after = ""
+
+    return {
+        "ok": True,
+        "changed": bool(before and after and before != after),
+        "before": before,
+        "after": after,
+        "summary": pull.stdout.strip().splitlines()[-1] if pull.stdout.strip() else "",
+    }
+
+
 def _setup_ipc_server(database_connection) -> IPCServer:
     """Register handlers that enqueue jobs for the main loop to execute."""
     server = IPCServer()
@@ -207,6 +390,19 @@ def _setup_ipc_server(database_connection) -> IPCServer:
         extensions = req.get("extensions")
         if extensions is None and req.get("extension"):
             extensions = [req["extension"]]
+
+        skipped: list = []
+        if extensions:
+            # Drop names that are already in-flight so the same extension can't
+            # be queued twice (otherwise main loop would run it back-to-back).
+            extensions, skipped = _claim_extensions(extensions)
+            if not extensions:
+                return {
+                    "queued": False,
+                    "skipped": skipped,
+                    "reason": "extension(s) already running or queued",
+                }
+
         _ipc_jobs.put(
             (
                 JOB_RUN,
@@ -217,7 +413,10 @@ def _setup_ipc_server(database_connection) -> IPCServer:
                 },
             )
         )
-        return {"queued": True, "extensions": extensions}
+        result = {"queued": True, "extensions": extensions}
+        if skipped:
+            result["skipped"] = skipped
+        return result
 
     def cmd_reload(_req):
         # The next main() call already reloads the publoader package; queue a no-op run
@@ -236,25 +435,130 @@ def _setup_ipc_server(database_connection) -> IPCServer:
             "jobs": [str(j) for j in getattr(sched, "jobs", [])] if sched else [],
         }
 
-    def cmd_add_series(req):
-        data = req.get("data") or {}
-        manga_id = data.get("id")
-        if not manga_id:
-            return {"ok": False, "error": "missing 'id' field"}
-        path = resources_path.joinpath(config["Paths"]["manga_data_path"])
-        existing = open_manga_data(path)
-        existing[manga_id] = data
+    def cmd_pull(req):
+        """Pull the latest changes for one or more repos. The accepted names are
+        the keys of _REPO_DEFAULTS plus the alias 'all'."""
+        names = req.get("repos") or req.get("repo")
+        if isinstance(names, str):
+            names = [names]
+        if not names:
+            return {"ok": False, "error": "no repos requested"}
+        if "all" in names:
+            names = list(_REPO_DEFAULTS.keys())
+
+        per_repo: dict = {}
+        any_changed = False
+        any_ok = True
+        for name in names:
+            entry = _REPO_DEFAULTS.get(name)
+            if entry is None:
+                per_repo[name] = {"ok": False, "error": f"unknown repo {name!r}"}
+                any_ok = False
+                continue
+            path = _resolve_repo_path(name)
+            if path is None:
+                per_repo[name] = {
+                    "ok": False,
+                    "error": f"no path configured for {name!r} — set {entry[0]} or "
+                             f"[Repos]/{entry[1]} in config.ini",
+                }
+                any_ok = False
+                continue
+            if not path.is_dir():
+                per_repo[name] = {"ok": False, "error": f"path missing: {path}"}
+                any_ok = False
+                continue
+
+            try:
+                status = _git_pull(path)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.exception(f"pull for {name} crashed")
+                per_repo[name] = {"ok": False, "error": str(e)}
+                any_ok = False
+                continue
+
+            status["path"] = str(path)
+            per_repo[name] = status
+            if not status.get("ok"):
+                any_ok = False
+            if status.get("changed"):
+                any_changed = True
+
+        return {"ok": any_ok, "changed": any_changed, "repos": per_repo}
+
+    def cmd_list_schedule(_req):
+        effective = open_timings()
         try:
-            atomic_write_text(path, json.dumps(existing, indent=2))
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-        return {"saved": manga_id}
+            db_overrides = get_state_store().get_schedule_overrides()
+        except sqlite3.Error as e:
+            db_overrides = {}
+            logger.warning(f"State DB read failed: {e}")
+        return {"ok": True, "effective": effective, "db_overrides": db_overrides}
+
+    def cmd_set_schedule(req):
+        ext = (req.get("extension") or "").strip()
+        hour = req.get("hour")
+        minute = req.get("minute")
+        day = req.get("day")
+
+        if not _EXT_NAME_RE.match(ext):
+            return {"ok": False, "error": f"invalid extension name: {ext!r}"}
+        if not isinstance(hour, int) or not 0 <= hour <= 23:
+            return {"ok": False, "error": f"hour must be int 0-23 (got {hour!r})"}
+        if not isinstance(minute, int) or not 0 <= minute <= 59:
+            return {"ok": False, "error": f"minute must be int 0-59 (got {minute!r})"}
+        if day is not None and (not isinstance(day, int) or not 0 <= day <= 6):
+            return {"ok": False, "error": f"day must be int 0-6 (Mon=0) or null (got {day!r})"}
+
+        try:
+            get_state_store().upsert_schedule(ext, hour, minute, day)
+        except sqlite3.Error as e:
+            return {"ok": False, "error": f"state DB write failed: {e}"}
+
+        try:
+            _reschedule_all(database_connection)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("reschedule failed")
+            return {
+                "ok": True,
+                "stored": True,
+                "rescheduled": False,
+                "error": f"stored but reschedule failed: {e}",
+            }
+        return {"ok": True, "stored": True, "rescheduled": True}
+
+    def cmd_remove_schedule(req):
+        ext = (req.get("extension") or "").strip()
+        if not _EXT_NAME_RE.match(ext):
+            return {"ok": False, "error": f"invalid extension name: {ext!r}"}
+        try:
+            removed = get_state_store().remove_schedule(ext)
+        except sqlite3.Error as e:
+            return {"ok": False, "error": f"state DB write failed: {e}"}
+
+        if removed == 0:
+            return {"ok": True, "removed": False, "reason": "no DB override existed"}
+
+        try:
+            _reschedule_all(database_connection)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("reschedule failed")
+            return {
+                "ok": True,
+                "removed": True,
+                "rescheduled": False,
+                "error": str(e),
+            }
+        return {"ok": True, "removed": True, "rescheduled": True}
 
     server.register("run", cmd_run)
     server.register("reload", cmd_reload)
     server.register("restart", cmd_restart)
     server.register("status", cmd_status)
-    server.register("add_series", cmd_add_series)
+    server.register("pull", cmd_pull)
+    server.register("list_schedule", cmd_list_schedule)
+    server.register("set_schedule", cmd_set_schedule)
+    server.register("remove_schedule", cmd_remove_schedule)
     server.start()
     return server
 

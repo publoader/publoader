@@ -21,10 +21,18 @@ MANGADEX_AUTH_URL=https://auth.mangadex.org/realms/mangadex/protocol/openid-conn
 RESOURCES_PATH=resources
 MDAUTH_PATH=.mdauth
 COMMITS_PATH=.commits
+# One or more discord webhook URLs; comma- or newline-separated for multiple.
 WEBHOOK_URL=
 MANGA_DATA_PATH=manga_data.json
 DISCORD_COMMAND_PREFIX=!
 DISCORD_GUILD_ID=
+# Comma- or space-separated channel / thread IDs the bot accepts commands from.
+# Leave blank to allow any channel the bot can see.
+DISCORD_ALLOWED_CHANNELS=
+# Users / roles permitted to invoke /add (and !add). Comma- or space-separated
+# discord IDs. Leave both blank to allow anyone in the allowed channel(s).
+DISCORD_ADMIN_USERS=
+DISCORD_ADMIN_ROLES=
 
 [Repo]
 REPO_OWNER=publoader

@@ -5,6 +5,11 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    depends_on:
+      publoader-extensions:
+        # Wait for the sidecar's sync_extensions.py to finish before starting,
+        # otherwise load_extensions runs against an empty volume.
+        condition: service_completed_successfully
     volumes:
       - ./config.ini:/app/config.ini
       - ./logs:/app/logs
@@ -21,8 +26,9 @@ services:
     restart: "no"
     volumes:
       - extensions:/shared/publoader/extensions
-    # This ensures the container stays running to maintain the volume
-    command: ["tail", "-f", "/dev/null"]
+    # The image's CMD is `python sync_extensions.py`, which copies the bundled
+    # extensions into the shared volume and exits. Don't override that — the
+    # named volume keeps the contents after the container exits.
 
   watchtower:
     image: containrrr/watchtower:latest

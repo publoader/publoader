@@ -86,6 +86,7 @@ setup_logs(
 setup_logs("publoader-uploader", worker_logs_folder_path.joinpath("uploader"))
 setup_logs("publoader-editor", worker_logs_folder_path.joinpath("editor"))
 setup_logs("publoader-deleter", worker_logs_folder_path.joinpath("deleter"))
+setup_logs("publoader-unavailable", worker_logs_folder_path.joinpath("unavailable"))
 
 _logger = logging.getLogger("publoader")
 
@@ -130,6 +131,7 @@ def _attach_error_webhook_handler() -> None:
         "publoader-uploader",
         "publoader-editor",
         "publoader-deleter",
+        "publoader-unavailable",
     ):
         attach_error_webhook_handler(name)
 

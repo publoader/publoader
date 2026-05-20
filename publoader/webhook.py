@@ -11,11 +11,29 @@ from publoader.utils.config import config
 from publoader.utils.utils import EXPIRE_TIME, get_current_datetime
 
 logger = logging.getLogger("webhook")
-webhook_url = config["Paths"].get("webhook_url")
+
+
+def _parse_webhook_urls(raw: Optional[str]) -> List[str]:
+    """Accept a single URL, or comma/newline-separated list."""
+    if not raw:
+        return []
+    parts = [chunk.strip() for chunk in raw.replace(",", "\n").splitlines()]
+    return [p for p in parts if p]
+
+
+webhook_urls: List[str] = _parse_webhook_urls(config["Paths"].get("webhook_url"))
+# Back-compat alias — some external code may read this.
+webhook_url = webhook_urls[0] if webhook_urls else None
 
 
 def make_webhook():
-    return DiscordWebhook(url=webhook_url, rate_limit_retry=True)
+    # discord_webhook supports url=list[str], posting to every URL on .execute().
+    if not webhook_urls:
+        return DiscordWebhook(url="", rate_limit_retry=True)
+    return DiscordWebhook(
+        url=webhook_urls if len(webhook_urls) > 1 else webhook_urls[0],
+        rate_limit_retry=True,
+    )
 
 
 webhook = make_webhook()
@@ -165,7 +183,7 @@ class WebhookHelper:
                 local_webhook.embeds[index:index] = split_embeds
 
     def send_webhook(self, local_webhook: DiscordWebhook = webhook):
-        if webhook_url is None:
+        if not webhook_urls:
             return
 
         if not local_webhook.embeds:
@@ -504,7 +522,7 @@ class WebhookLogHandler(logging.Handler):
             return
         if record.name in ("webhook", "discord_webhook"):
             return
-        if not webhook_url:
+        if not webhook_urls:
             return
         _emit_guard.active = True
         try:
