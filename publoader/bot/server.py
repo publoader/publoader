@@ -609,6 +609,60 @@ def _register_commands(bot: PubloaderBot) -> None:
             return
         await bot._dispatch(ctx, "remove_schedule", extension=extension)
 
+    # ----- /removal group: chapter expiry behaviour -----
+    _REMOVAL_MODES = ("unavailable", "delete")
+
+    async def _removal_mode_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> List[app_commands.Choice[str]]:
+        needle = (current or "").lower()
+        return [
+            app_commands.Choice(name=m, value=m)
+            for m in _REMOVAL_MODES
+            if not needle or needle in m
+        ]
+
+    removal_group = app_commands.Group(
+        name="removal",
+        description="Control how expired chapters are dropped (unavailable vs delete).",
+    )
+
+    @removal_group.command(
+        name="show",
+        description="Show the current chapter-removal mode.",
+    )
+    async def _removal_show(interaction: discord.Interaction):
+        await bot._dispatch_slash(interaction, "get_removal_mode")
+
+    @removal_group.command(
+        name="set",
+        description="Set chapter-removal mode globally (admin-only). Extensions can still force a mode.",
+    )
+    @app_commands.describe(mode="`unavailable` keeps the chapter card; `delete` removes it outright.")
+    @app_commands.autocomplete(mode=_removal_mode_autocomplete)
+    async def _removal_set(interaction: discord.Interaction, mode: str):
+        if not _is_admin(interaction.user):
+            await interaction.response.send_message("Not allowed.", ephemeral=True)
+            return
+        await bot._dispatch_slash(interaction, "set_removal_mode", mode=mode)
+
+    bot.tree.add_command(removal_group)
+
+    @bot.group(name="removal", invoke_without_command=True)
+    async def _removal_prefix(ctx: commands.Context):
+        await bot._dispatch(ctx, "get_removal_mode")
+
+    @_removal_prefix.command(name="show")
+    async def _removal_prefix_show(ctx: commands.Context):
+        await bot._dispatch(ctx, "get_removal_mode")
+
+    @_removal_prefix.command(name="set")
+    async def _removal_prefix_set(ctx: commands.Context, mode: str):
+        if not _is_admin(ctx.author):
+            await ctx.send("Not allowed.")
+            return
+        await bot._dispatch(ctx, "set_removal_mode", mode=mode)
+
 def run() -> int:
     token = _bot_token()
     if not token:

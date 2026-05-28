@@ -43,7 +43,23 @@ CREATE TABLE IF NOT EXISTS run_history (
     completed_at DATETIME,
     success INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
+
+# Default behaviour when an extension drops a chapter and offers no override.
+# Marked unavailable preserves the chapter card on MangaDex; "delete" enqueues
+# for hard removal via the existing to_delete pipeline.
+REMOVAL_MODE_UNAVAILABLE = "unavailable"
+REMOVAL_MODE_DELETE = "delete"
+VALID_REMOVAL_MODES = (REMOVAL_MODE_UNAVAILABLE, REMOVAL_MODE_DELETE)
+DEFAULT_REMOVAL_MODE = REMOVAL_MODE_UNAVAILABLE
+
+_REMOVAL_MODE_KEY = "chapter_removal_mode"
 
 
 class StateStore:
@@ -137,6 +153,49 @@ class StateStore:
             self.conn.commit()
             return cur.rowcount
 
+    # ---------- generic settings ----------
+
+    def get_setting(self, key: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._write_lock:
+            self.conn.execute(
+                """
+                INSERT INTO settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, value),
+            )
+            self.conn.commit()
+
+    def clear_setting(self, key: str) -> int:
+        with self._write_lock:
+            cur = self.conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            self.conn.commit()
+            return cur.rowcount
+
+    # ---------- chapter removal mode ----------
+
+    def get_removal_mode(self) -> str:
+        value = self.get_setting(_REMOVAL_MODE_KEY)
+        if value in VALID_REMOVAL_MODES:
+            return value
+        return DEFAULT_REMOVAL_MODE
+
+    def set_removal_mode(self, mode: str) -> str:
+        if mode not in VALID_REMOVAL_MODES:
+            raise ValueError(
+                f"mode must be one of {VALID_REMOVAL_MODES} (got {mode!r})"
+            )
+        self.set_setting(_REMOVAL_MODE_KEY, mode)
+        return mode
+
     # ---------- run history (informational; written by the runner) ----------
 
     def record_run_started(
@@ -174,3 +233,22 @@ def get_state_store() -> StateStore:
             if _singleton is None:
                 _singleton = StateStore().open()
     return _singleton
+
+
+def resolve_chapter_removal_mode(extension=None) -> str:
+    """Effective removal mode for an extension.
+
+    Precedence: extension.chapter_removal_mode (force override) >
+    StateStore global setting > DEFAULT_REMOVAL_MODE. Invalid values
+    anywhere in the chain are ignored and fall through.
+    """
+    if extension is not None:
+        override = getattr(extension, "chapter_removal_mode", None)
+        if isinstance(override, str) and override in VALID_REMOVAL_MODES:
+            return override
+
+    try:
+        return get_state_store().get_removal_mode()
+    except sqlite3.Error:
+        logger.warning("State DB read failed; using default removal mode", exc_info=True)
+        return DEFAULT_REMOVAL_MODE

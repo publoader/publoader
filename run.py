@@ -551,6 +551,40 @@ def _setup_ipc_server(database_connection) -> IPCServer:
             }
         return {"ok": True, "removed": True, "rescheduled": True}
 
+    def cmd_get_removal_mode(_req):
+        from publoader.state.store import (
+            DEFAULT_REMOVAL_MODE,
+            VALID_REMOVAL_MODES,
+        )
+        try:
+            mode = get_state_store().get_removal_mode()
+            row_set = get_state_store().get_setting("chapter_removal_mode")
+        except sqlite3.Error as e:
+            return {"ok": False, "error": f"state DB read failed: {e}"}
+        return {
+            "ok": True,
+            "mode": mode,
+            "explicit": row_set is not None,
+            "default": DEFAULT_REMOVAL_MODE,
+            "valid_modes": list(VALID_REMOVAL_MODES),
+        }
+
+    def cmd_set_removal_mode(req):
+        from publoader.state.store import VALID_REMOVAL_MODES
+        mode = (req.get("mode") or "").strip().lower()
+        if mode not in VALID_REMOVAL_MODES:
+            return {
+                "ok": False,
+                "error": (
+                    f"mode must be one of {list(VALID_REMOVAL_MODES)} (got {mode!r})"
+                ),
+            }
+        try:
+            get_state_store().set_removal_mode(mode)
+        except sqlite3.Error as e:
+            return {"ok": False, "error": f"state DB write failed: {e}"}
+        return {"ok": True, "mode": mode}
+
     server.register("run", cmd_run)
     server.register("reload", cmd_reload)
     server.register("restart", cmd_restart)
@@ -559,6 +593,8 @@ def _setup_ipc_server(database_connection) -> IPCServer:
     server.register("list_schedule", cmd_list_schedule)
     server.register("set_schedule", cmd_set_schedule)
     server.register("remove_schedule", cmd_remove_schedule)
+    server.register("get_removal_mode", cmd_get_removal_mode)
+    server.register("set_removal_mode", cmd_set_removal_mode)
     server.start()
     return server
 

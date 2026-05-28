@@ -325,3 +325,49 @@ def mark_chapters_unavailable(
         logger.exception(
             f"{mark_chapters_unavailable.__name__} raised an error when removing from 'uploaded'."
         )
+
+
+def enqueue_chapter_removal(
+    database_connection,
+    extension_name: str,
+    md_manga_id: str,
+    md_chapter=None,
+    chapter=None,
+    mangadex_manga_data=None,
+    extension=None,
+    mode: str = None,
+    **kwargs,
+):
+    """Route a removed chapter to the unavailable-queue or the hard-delete queue.
+
+    Resolution order for `mode`: explicit arg > extension override >
+    StateStore global setting > DEFAULT_REMOVAL_MODE. See
+    `publoader.state.store.resolve_chapter_removal_mode`.
+    """
+    from publoader.state.store import (
+        REMOVAL_MODE_DELETE,
+        VALID_REMOVAL_MODES,
+        resolve_chapter_removal_mode,
+    )
+
+    effective = mode if mode in VALID_REMOVAL_MODES else resolve_chapter_removal_mode(extension)
+
+    if effective == REMOVAL_MODE_DELETE:
+        return update_expired_chapter_database(
+            database_connection=database_connection,
+            extension_name=extension_name,
+            md_manga_id=md_manga_id,
+            md_chapter=md_chapter,
+            chapter=chapter,
+            mangadex_manga_data=mangadex_manga_data,
+            **kwargs,
+        )
+    return mark_chapters_unavailable(
+        database_connection=database_connection,
+        extension_name=extension_name,
+        md_manga_id=md_manga_id,
+        md_chapter=md_chapter,
+        chapter=chapter,
+        mangadex_manga_data=mangadex_manga_data,
+        **kwargs,
+    )
