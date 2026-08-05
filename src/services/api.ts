@@ -34,9 +34,9 @@ const seedOwner = async (): Promise<void> => {
     {
       email: owner.email,
       hasPassword: owner.passwordHash !== null,
-      discordLinked: owner.discordId !== null,
+      mangadexLinked: owner.mangadexId !== null,
     },
-    owner.passwordHash === null && owner.discordId === null
+    owner.passwordHash === null && owner.mangadexId === null
       ? "owner account has no credentials yet: sign in with ADMIN_TOKEN and set a password from the Users view"
       : "owner account ready",
   );

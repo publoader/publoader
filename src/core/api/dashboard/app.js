@@ -1189,15 +1189,15 @@ async function showApp(session) {
 async function applyLoginMethods() {
   try {
     const methods = await api("/session/methods", { allow401: true });
-    $("login-discord-wrap").hidden = !methods.discord;
-    $("login-signups").hidden = !(methods.discord && methods.signups);
+    $("login-md-wrap").hidden = !methods.mangadex;
+    $("login-signups").hidden = !(methods.mangadex && methods.signups);
   } catch {
     // A deployment that cannot answer still offers password + token login.
-    $("login-discord-wrap").hidden = true;
+    $("login-md-wrap").hidden = true;
   }
 }
 
-async function submitLogin(event, body, clear) {
+async function submitLogin(event, body, clear, path = "/session") {
   event.preventDefault();
   const button = event.submitter ?? event.target.querySelector('button[type="submit"]');
   $("login-error").textContent = "";
@@ -1206,12 +1206,18 @@ async function submitLogin(event, body, clear) {
     button.disabled = true;
   }
   try {
-    const res = await api("/session", { method: "POST", body, allow401: true });
+    const res = await api(path, { method: "POST", body, allow401: true });
     clear();
     await showApp(res);
     renderRoute();
   } catch (err) {
     $("login-error").textContent = err.message;
+    // The account has no MangaDex client stored (or the stored one no longer
+    // decrypts). Reveal the fields rather than leaving a dead end.
+    if (err.data && err.data.needsClient) {
+      $("login-md-client").hidden = false;
+      $("login-md-client-id").focus();
+    }
   } finally {
     if (button) {
       delete button.dataset.pending;
@@ -1236,6 +1242,27 @@ const loginWithToken = (event) =>
     () => {
       $("login-token").value = "";
     },
+  );
+
+/**
+ * A form, not a redirect: MangaDex has not shipped public OAuth clients, so the
+ * only grant available is `password` and core-api makes it on our behalf. The
+ * client id/secret ride along only on the first login for an account.
+ */
+const loginWithMangadex = (event) =>
+  submitLogin(
+    event,
+    {
+      username: $("login-md-username").value.trim(),
+      password: $("login-md-password").value,
+      clientId: $("login-md-client-id").value.trim() || undefined,
+      clientSecret: $("login-md-client-secret").value || undefined,
+    },
+    () => {
+      $("login-md-password").value = "";
+      $("login-md-client-secret").value = "";
+    },
+    "/session/mangadex",
   );
 
 async function logout() {
@@ -1669,6 +1696,13 @@ function renderPageHead(entry, route) {
 
 async function boot() {
   $("login-form").addEventListener("submit", loginWithPassword);
+  $("login-md-form").addEventListener("submit", loginWithMangadex);
+  $("login-md-toggle").addEventListener("click", () => {
+    const form = $("login-md-form");
+    form.hidden = !form.hidden;
+    $("login-md-toggle").setAttribute("aria-expanded", String(!form.hidden));
+    if (!form.hidden) $("login-md-username").focus();
+  });
   $("login-token-form").addEventListener("submit", loginWithToken);
   $("login-token-toggle").addEventListener("click", () => {
     const form = $("login-token-form");
@@ -6223,6 +6257,12 @@ VIEWS.users = (route) => {
   const users = new Resource("users", () => api("/users"));
 
   const inviteEmail = el("input", { id: "invite-email", type: "email", placeholder: "them@example.com" });
+  const inviteMangadex = el("input", {
+    id: "invite-mangadex",
+    type: "text",
+    maxlength: "190",
+    placeholder: "their MangaDex username",
+  });
   const inviteRole = el(
     "select",
     { id: "invite-role", "aria-label": "Role for the invited account" },
@@ -6237,8 +6277,9 @@ VIEWS.users = (route) => {
       el("p", {
         class: "dim small",
         text:
-          "Creates an approved account with no credentials. They get in by linking Discord with that email, " +
-          "or by you setting a password below.",
+          "Creates an approved account with no credentials. They get in by signing in with the MangaDex " +
+          "username you name here, or by you setting a password below. Naming the MangaDex username is what " +
+          "authorises it: an uninvited account is refused unless it is in an allowed scanlation group.",
       }),
       el("p", {
         class: "dim small",
@@ -6250,6 +6291,8 @@ VIEWS.users = (route) => {
       row(
         el("label", { class: "inline", for: "invite-email", text: "Email" }),
         inviteEmail,
+        el("label", { class: "inline", for: "invite-mangadex", text: "MangaDex" }),
+        inviteMangadex,
         el("label", { class: "inline", for: "invite-role", text: "Role" }),
         inviteRole,
         el("button", {
@@ -6263,11 +6306,18 @@ VIEWS.users = (route) => {
               () =>
                 api("/users", {
                   method: "POST",
-                  body: { email: inviteEmail.value.trim(), role: inviteRole.value },
+                  body: {
+                    email: inviteEmail.value.trim(),
+                    role: inviteRole.value,
+                    mangadexUsername: inviteMangadex.value.trim() || undefined,
+                  },
                 }),
               { button: event.currentTarget, refresh: [users] },
             ).then((ok) => {
-              if (ok) inviteEmail.value = "";
+              if (ok) {
+                inviteEmail.value = "";
+                inviteMangadex.value = "";
+              }
             });
           },
         }),
@@ -6285,13 +6335,23 @@ VIEWS.users = (route) => {
                 "div",
                 {},
                 el("div", { text: user.email }),
-                user.discordUsername
-                  ? el("div", { class: "dim small", text: `discord: ${user.discordUsername}` })
+                user.mangadexUsername
+                  ? el("div", {
+                      class: "dim small",
+                      // Unbound until they have actually signed in once, which
+                      // is the difference between "invited" and "claimed".
+                      text: `mangadex: ${user.mangadexUsername}${user.mangadexId ? "" : " (not yet claimed)"}`,
+                    })
                   : null,
               ),
               chip(user.role),
               chip(user.approved ? "approved" : "pending"),
-              user.hasPassword ? "password" : user.discordId ? "discord only" : "no credentials",
+              [
+                user.hasPassword ? "password" : null,
+                user.mangadexId ? (user.hasMangadexClient ? "mangadex" : "mangadex (client needed)") : null,
+              ]
+                .filter(Boolean)
+                .join(", ") || "no credentials",
               user.lastLoginAt ? ago(user.lastLoginAt) : "never",
               [
                 !user.approved
@@ -6506,7 +6566,7 @@ function signupsPanel() {
             el("label", {
               class: "inline",
               for: "signups-enabled",
-              text: "Allow new Discord logins to create accounts",
+              text: "Allow new MangaDex logins to create accounts",
             }),
           ),
           el("p", {
@@ -6514,6 +6574,13 @@ function signupsPanel() {
             text:
               "New accounts always land unapproved and with the ADMIN role; somebody has to approve them on " +
               "the Accounts tab before they can sign in.",
+          }),
+          el("p", {
+            class: "dim small",
+            text:
+              "This only ever admits members of the scanlation groups named in " +
+              "MANGADEX_ALLOWED_GROUP_IDS. With that unset, signups are refused however this is set, and " +
+              "the only way in is an invite.",
           }),
         );
       },

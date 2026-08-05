@@ -292,9 +292,9 @@ of which are database constraints. So:
 - Is any plaintext credential returned by more than the one endpoint that mints
   it? There must be no path that reveals an existing secret.
 - Does any log line, error message, or audit `detail` include a credential? Note
-  the specific hazards already handled: a Discord token-exchange failure body can
-  echo the authorization code, so it is never logged verbatim
-  (`src/core/api/oauth.ts:187-190`); the MangaDex auth endpoint reports
+  the specific hazards already handled: a MangaDex token-grant failure body can
+  echo the operator's password, so the error is reshaped before it is logged and
+  the raw one never is (`src/core/api/mangadexLogin.ts`); the MangaDex auth endpoint reports
   only *whether* tokens exist and when they expire, never their values
   (`routes/ops.ts:219-247`).
 - Does an error response leak internals? The handler collapses every 5xx to

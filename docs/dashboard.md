@@ -22,8 +22,52 @@ Three methods, in the order you should prefer them:
 | Method | For | Notes |
 |---|---|---|
 | Email + password | Day-to-day | Minimum 12 characters. An OWNER sets it from **Users → Accounts**, and anyone signed in can change their own from **the profile menu → Your account**. There is no self-service reset for a password you cannot sign in with. |
-| Discord | Teams already on Discord | Only shown when `DISCORD_CLIENT_ID` is configured. New accounts land unapproved and an OWNER must approve them — and only if self-signup is enabled. |
+| MangaDex | Signing in as the MangaDex account you already upload with | A form, not a redirect — see the caveat below. Only accounts an OWNER invited by MangaDex username, or members of a group in `MANGADEX_ALLOWED_GROUP_IDS`, are admitted. New accounts land unapproved. |
 | Admin token | Break-glass | The `ADMIN_TOKEN`, exchanged for a session cookie. Use it when the accounts table is the problem. It is never stored in the browser. |
+
+### Why MangaDex login is a form and not a button
+
+MangaDex documents two OAuth client types and has shipped one. Public clients —
+the `authorization_code` flow, the redirect out to `auth.mangadex.org` and back,
+the thing that would make this a one-click "Sign in with MangaDex" button — are
+[not yet available](https://api.mangadex.org/docs/02-authentication/). What
+exists is the *personal* client: a `password` grant, and "[only the account that
+owns a personal client can be used with
+it](https://api.mangadex.org/docs/02-authentication/personal-clients/)."
+
+Two consequences you have to live with until that changes:
+
+- **Your MangaDex password is posted to core-api.** It is forwarded to MangaDex
+  to obtain a token, and is never stored, never logged, and not held after the
+  request. There is no grant that avoids this today.
+- **Every operator needs their own personal API client.** One client cannot
+  authenticate the team. Each person creates one under **Settings → API
+  Clients** on mangadex.org, waits for staff approval, and enters the id and
+  secret once at their first login — it is stored encrypted (AES-256-GCM, keyed
+  off `SESSION_SECRET`) and reused after that. The single exception is the
+  account that owns the deployment's own `MANGADEX_CLIENT_ID`, which reuses it.
+
+Rotating `SESSION_SECRET` (or `ADMIN_TOKEN`, when `SESSION_SECRET` is unset)
+makes stored client secrets unreadable. That is not a failure: the next login
+asks for the secret again.
+
+### Who is allowed in
+
+The gate fails closed, in this order:
+
+1. **A bound MangaDex account UUID** is the operator. A rename on MangaDex's
+   side follows the account rather than losing it.
+2. **An unclaimed invite for that username** binds on first login. An OWNER
+   creates it from **Users → Accounts** by naming the MangaDex username. A row
+   already bound to a *different* UUID is refused — releasing a username on
+   MangaDex must not hand over the account that used to hold it.
+3. **Otherwise, self-signup**, and only when `MANGADEX_ALLOWED_GROUP_IDS` names
+   a scanlation group the account belongs to *and* the signup toggle is on. It
+   still lands unapproved. With no group configured there is nothing to verify
+   against, so signups are refused however the toggle is set.
+
+The group check applies to established accounts too, not just signups: someone
+who leaves the group stops being able to sign in.
 
 The session is an HttpOnly, `SameSite=Strict` cookie backed by a revocable row,
 so signing someone out actually ends their access rather than asking their

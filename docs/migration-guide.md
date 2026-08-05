@@ -602,7 +602,8 @@ current Postgres backup.
       Public Hostname route, then stop and remove the container and its image.
       Operators sign in with their own accounts now (`docs/deployment.md` →
       "Dashboard"), so also revoke the copy of `ADMIN_TOKEN` the old dashboard
-      held and the Discord OAuth app it used, if it had one of its own.
+      held, and delete the Discord OAuth app it used if it had one of its own —
+      the new dashboard signs operators in with MangaDex, not Discord.
 - [ ] **Remove the `docker.sock` mount** from `publoader-bot`. The bot mounted
       the Docker socket so `/start`, `/shutdown` and `/restart` could control
       the scheduler container. That mount is root-equivalent access to the host

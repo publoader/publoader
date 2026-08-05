@@ -46,13 +46,49 @@
           <button id="login-submit" type="submit" class="primary">Sign in</button>
         </form>
 
-        <p id="login-discord-wrap" hidden>
-          <a id="login-discord" class="button-link" href="/api/v1/admin/oauth/discord/start">
-            Sign in with Discord
-          </a>
+        <p id="login-md-wrap" hidden>
+          <button id="login-md-toggle" type="button" class="linkish" aria-expanded="false"
+                  aria-controls="login-md-form">
+            Sign in with MangaDex
+          </button>
         </p>
+
+        <!-- Not a redirect. MangaDex has no authorization_code flow yet, so
+             this is a password grant made server-side on the operator's
+             behalf; see src/core/api/mangadexLogin.ts. -->
+        <form id="login-md-form" autocomplete="on" hidden>
+          <p class="dim small">
+            Your MangaDex password is sent to MangaDex to obtain a token and is never stored.
+          </p>
+          <label for="login-md-username">MangaDex username</label>
+          <input id="login-md-username" name="username" type="text" required maxlength="190"
+                 autocomplete="username" />
+          <label for="login-md-password">MangaDex password</label>
+          <input id="login-md-password" name="password" type="password" required maxlength="1024"
+                 autocomplete="current-password" />
+
+          <!-- Shown only when the account has no client stored yet: MangaDex
+               personal clients are per-account, so each operator brings one. -->
+          <div id="login-md-client" hidden>
+            <p class="dim small">
+              This account needs its own MangaDex API client. Create a personal client under
+              <em>Settings → API Clients</em> on mangadex.org, wait for it to be approved, then
+              enter it once — it is stored encrypted and reused next time.
+            </p>
+            <label for="login-md-client-id">Client ID</label>
+            <input id="login-md-client-id" name="clientId" type="text" maxlength="190"
+                   autocomplete="off" placeholder="personal-client-…" />
+            <label for="login-md-client-secret">Client secret</label>
+            <input id="login-md-client-secret" name="clientSecret" type="password" maxlength="512"
+                   autocomplete="off" />
+          </div>
+
+          <button id="login-md-submit" type="submit">Sign in with MangaDex</button>
+        </form>
+
         <p id="login-signups" class="dim small" hidden>
-          New Discord accounts are accepted, but an owner must approve them before first use.
+          Members of the allowed scanlation groups may sign up, but an owner must approve them
+          before first use.
         </p>
 
         <p>

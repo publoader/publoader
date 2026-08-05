@@ -1,4 +1,4 @@
-import { createHmac, hkdfSync, timingSafeEqual } from "node:crypto";
+import { hkdfSync } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AdminRole, AdminUser } from "@prisma/client";
 import { z } from "zod";
@@ -22,42 +22,26 @@ import { verifyPassword } from "../store/adminUsers.js";
  */
 
 export const SESSION_COOKIE = "publoader_session";
-/** Short-lived cookie carrying the signed OAuth state nonce. */
-export const OAUTH_STATE_COOKIE = "publoader_oauth_state";
 
 /** Bound what we are willing to parse; a session cookie is ~90 bytes. */
 const MAX_COOKIE_BYTES = 4096;
 
 /**
- * HMAC key for short-lived signed cookies (the OAuth state nonce). Session
- * cookies no longer depend on it — they are DB rows. An explicit
- * SESSION_SECRET is preferred; otherwise derive from the admin token via HKDF
- * so the raw token is never itself an HMAC key.
+ * Long-lived key material for this deployment. Session cookies do not depend
+ * on it — they are DB rows — but sealed secrets do (src/core/api/secretBox.ts,
+ * which derives its own key from this one). An explicit SESSION_SECRET is
+ * preferred; otherwise derive from the admin token via HKDF so the raw token is
+ * never itself a key.
  */
 export function deriveSigningKey(config: Config, log: Logger): Buffer | null {
   if (config.sessionSecret) return Buffer.from(config.sessionSecret, "utf8");
   if (!config.adminToken) return null;
   log.warn(
-    "SESSION_SECRET is not set: deriving the cookie signing key from ADMIN_TOKEN. " +
-      "Rotating ADMIN_TOKEN will invalidate in-flight Discord logins.",
+    "SESSION_SECRET is not set: deriving the key from ADMIN_TOKEN. Rotating " +
+      "ADMIN_TOKEN will make stored MangaDex client secrets unreadable, and " +
+      "operators will be asked for them again at the next login.",
   );
   return Buffer.from(hkdfSync("sha256", config.adminToken, "publoader-session-v1", "dashboard-cookie-hmac", 32));
-}
-
-export function signValue(value: string, key: Buffer): string {
-  return `${value}.${createHmac("sha256", key).update(value).digest("base64url")}`;
-}
-
-/** Returns the value only when the signature verifies. */
-export function unsignValue(signed: string, key: Buffer): string | null {
-  if (signed.length > MAX_COOKIE_BYTES) return null;
-  const dot = signed.lastIndexOf(".");
-  if (dot <= 0 || dot === signed.length - 1) return null;
-  const value = signed.slice(0, dot);
-  const given = signed.slice(dot + 1);
-  const expected = createHmac("sha256", key).update(value).digest("base64url");
-  if (given.length !== expected.length) return null;
-  return timingSafeEqual(Buffer.from(given, "utf8"), Buffer.from(expected, "utf8")) ? value : null;
 }
 
 /** Read one cookie out of a raw Cookie header without pulling in a plugin. */
@@ -139,40 +123,57 @@ const PasswordLogin = z.object({
  * authentication — so they live outside the admin scope and carry their own
  * per-IP limiter.
  */
-export function registerSessionRoutes(app: FastifyInstance, ctx: AppContext): void {
+/**
+ * Mint the session cookie and record the login. Shared by every way in —
+ * password, break-glass token, and MangaDex — so they cannot drift in cookie
+ * attributes or in what lands in the audit log.
+ */
+export async function issueSession(
+  ctx: AppContext,
+  req: FastifyRequest,
+  reply: FastifyReply,
+  user: AdminUser,
+  actor: string,
+  meta: Record<string, unknown> = {},
+): Promise<FastifyReply> {
   const ttlSeconds = ctx.config.sessionTtlMinutes * 60;
+  const cookie = await ctx.adminUsers.createSession(user, actor, ttlSeconds);
+  await ctx.audit.record(`admin:${actor}`, "session.login", user.id, {
+    ip: req.ip,
+    email: user.email,
+    ...meta,
+  });
+  return reply
+    .header(
+      "set-cookie",
+      cookieHeader(SESSION_COOKIE, cookie, ttlSeconds, isSecureRequest(req, ctx.config)),
+    )
+    .send({
+      ok: true,
+      actor,
+      role: user.role,
+      email: user.email,
+      expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+    });
+}
+
+export function registerSessionRoutes(app: FastifyInstance, ctx: AppContext): void {
   const authenticate = sessionAuthenticator(ctx);
 
-  const issue = async (
-    reply: FastifyReply,
-    req: FastifyRequest,
-    user: AdminUser,
-    actor: string,
-  ) => {
-    const cookie = await ctx.adminUsers.createSession(user, actor, ttlSeconds);
-    await ctx.audit.record(`admin:${actor}`, "session.login", user.id, { ip: req.ip, email: user.email });
-    return reply
-      .header(
-        "set-cookie",
-        cookieHeader(SESSION_COOKIE, cookie, ttlSeconds, isSecureRequest(req, ctx.config)),
-      )
-      .send({
-        ok: true,
-        actor,
-        role: user.role,
-        email: user.email,
-        expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
-      });
-  };
+  const issue = (reply: FastifyReply, req: FastifyRequest, user: AdminUser, actor: string) =>
+    issueSession(ctx, req, reply, user, actor);
 
   /**
    * Which login methods to render. Unauthenticated on purpose: it exposes only
-   * whether OAuth is configured and whether signups are open, both of which
-   * are visible from the login page anyway.
+   * whether MangaDex login is configured and whether signups are open, both of
+   * which are visible from the login page anyway.
    */
   app.get("/api/v1/admin/session/methods", async () => ({
-    discord: Boolean(ctx.config.discordClientId && ctx.config.discordClientSecret),
-    signups: await ctx.settings.getSignupsEnabled(),
+    // MangaDex login needs no deployment-wide OAuth app — operators bring
+    // their own personal client — so it is always on offer.
+    mangadex: true,
+    /** Whether an unknown-but-group-verified account may self-signup. */
+    signups: Boolean(ctx.config.mdAllowedGroupIds.trim()) && (await ctx.settings.getSignupsEnabled()),
     password: true,
   }));
 

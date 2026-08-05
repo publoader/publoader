@@ -68,7 +68,7 @@ describe.skipIf(!dbReady())("dashboard sessions, accounts, and assets", () => {
 
   it("seeds an approved owner account with no credentials", async () => {
     const owner = await prisma.adminUser.findUniqueOrThrow({ where: { email: OWNER_EMAIL } });
-    expect(owner).toMatchObject({ role: "OWNER", approved: true, passwordHash: null, discordId: null });
+    expect(owner).toMatchObject({ role: "OWNER", approved: true, passwordHash: null, mangadexId: null });
 
     // Seeding is idempotent and repairs a demoted or unapproved owner.
     await prisma.adminUser.update({ where: { id: owner.id }, data: { role: "ADMIN", approved: false } });
@@ -80,8 +80,47 @@ describe.skipIf(!dbReady())("dashboard sessions, accounts, and assets", () => {
   it("advertises only the login methods this deployment offers", async () => {
     const res = await app.inject({ method: "GET", url: "/api/v1/admin/session/methods" });
     expect(res.statusCode).toBe(200);
-    // No DISCORD_CLIENT_ID in this config, so the button must stay hidden.
-    expect(res.json()).toMatchObject({ discord: false, signups: false, password: true });
+    // MangaDex login needs no deployment-wide OAuth app, so it is always on
+    // offer; signups stay off because no scanlation group is allowlisted.
+    expect(res.json()).toMatchObject({ mangadex: true, signups: false, password: true });
+  });
+
+  // ---- MangaDex login ----
+
+  const mangadexLogin = (payload: Record<string, unknown>) =>
+    app.inject({ method: "POST", url: "/api/v1/admin/session/mangadex", payload });
+
+  it("rejects a MangaDex login with no credentials at all", async () => {
+    const res = await mangadexLogin({ username: "ardax" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain("username and password are required");
+  });
+
+  /**
+   * Nothing here reaches MangaDex: with no client stored for the account and
+   * no deployment client matching the username, the request is refused before
+   * a grant is attempted. That is also what tells the UI to reveal the client
+   * fields.
+   */
+  it("asks for a personal API client when the account has none", async () => {
+    const res = await mangadexLogin({ username: "somebody", password: "hunter2hunter2" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ needsClient: true });
+    expect(res.json().error).toContain("personal client");
+  });
+
+  it("never reports whether a MangaDex username is known", async () => {
+    const invited = await ctx.adminUsers.invite("md@example.com", "ADMIN", "invited-operator");
+    expect(invited.mangadexUsername).toBe("invited-operator");
+
+    // An invited username and an unknown one are indistinguishable from
+    // outside: both stop at the same "you need a client" answer.
+    const known = await mangadexLogin({ username: "invited-operator", password: "hunter2hunter2" });
+    const unknown = await mangadexLogin({ username: "nobody-at-all", password: "hunter2hunter2" });
+    expect(known.statusCode).toBe(unknown.statusCode);
+    expect(known.json()).toEqual(unknown.json());
+
+    await prisma.adminUser.delete({ where: { id: invited.id } });
   });
 
   // ---- session lifecycle ----
@@ -298,7 +337,13 @@ describe.skipIf(!dbReady())("dashboard sessions, accounts, and assets", () => {
       payload: { enabled: true },
     });
     expect(on.json()).toMatchObject({ ok: true, enabled: true });
-    expect((await app.inject({ method: "GET", url: "/api/v1/admin/session/methods" })).json().signups).toBe(true);
+
+    // The setting is on, but this deployment allowlists no scanlation group,
+    // so there is nothing a self-signup could be verified against and the
+    // login page must not offer it. The toggle alone can never open the door.
+    const methods = await app.inject({ method: "GET", url: "/api/v1/admin/session/methods" });
+    expect(methods.json()).toMatchObject({ signups: false });
+    expect((await ctx.settings.getSignupsEnabled())).toBe(true);
   });
 
   // ---- the contributor role ----

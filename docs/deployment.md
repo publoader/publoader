@@ -313,7 +313,8 @@ credentials yet. It is seeded **without** a password, so first sign-in is:
 
 From there, **Users → Invite** creates further accounts. An invited account is
 approved but has no credentials: they get in either by an owner setting a
-password for them, or by linking Discord with that email address.
+password for them, or — when the invite names their MangaDex username — by
+signing in with that MangaDex account.
 
 ### Sessions
 
@@ -334,50 +335,51 @@ SESSION_COOKIE_SECURE=true   # optional; see below
 SESSION_SECRET=$(openssl rand -base64 48)
 ```
 
-`SESSION_SECRET` signs the short-lived OAuth state cookie. It is optional —
-without it the key is derived from `ADMIN_TOKEN` via HKDF and core-api warns at
-boot — but set it, or rotating `ADMIN_TOKEN` will break in-flight Discord
-logins.
+`SESSION_SECRET` keys the encryption of stored MangaDex client secrets. It is
+optional — without it the key is derived from `ADMIN_TOKEN` via HKDF and
+core-api warns at boot — but set it, or rotating `ADMIN_TOKEN` will make those
+stored secrets unreadable and every operator will be asked for theirs again.
 
 The `Secure` cookie attribute is set when the request arrives with
 `x-forwarded-proto: https`, which cloudflared sends. Set
 `SESSION_COOKIE_SECURE=true` if you front core-api with something that does not.
 
-### Discord OAuth (optional)
+### MangaDex login
 
-Create an application at <https://discord.com/developers/applications>, then
-under **OAuth2**:
+Nothing to register on your side — there is no OAuth application to create,
+because MangaDex has not shipped public OAuth clients. See
+[dashboard.md](dashboard.md#why-mangadex-login-is-a-form-and-not-a-button) for
+what that costs you; the short version is that each operator brings their own
+personal API client and their password is posted to core-api.
 
-- **Redirects**: add `https://publoader.ardax.dev/api/v1/admin/oauth/discord/callback`.
-  It must match `DASH_PUBLIC_URL` exactly — Discord compares the string, and a
-  trailing slash or an `http://` scheme is a different URI.
-- Copy the **Client ID** and **Client Secret**.
+The one setting is who gets in:
 
 ```bash
-# .env
-DASH_PUBLIC_URL=https://publoader.ardax.dev
-DISCORD_CLIENT_ID=...
-DISCORD_CLIENT_SECRET=...
+# .env — scanlation groups whose members may sign in, comma-separated.
+MANGADEX_ALLOWED_GROUP_IDS=b1c2d3e4-0000-0000-0000-000000000000
 ```
 
-No bot, no gateway, no invite: the scopes are `identify email` only. Leave
-either variable blank and the "Sign in with Discord" button does not render.
+Leave it **empty** for the strictest setting: self-signup is refused outright
+and the only way in is an OWNER inviting a MangaDex username from **Users →
+Accounts**. Set it and members of those groups may self-signup — still
+unapproved, and still needing an owner's approval — when the signup toggle in
+**Users → Self-signup** is on. That toggle is off by default.
 
-How a Discord login is matched, in order:
+How a MangaDex login is matched, in order:
 
-1. **Already linked** — the `discordId` is on an account: sign in. An email
-   change on Discord's side cannot repoint the login.
-2. **Verified email matches an account** — link the Discord id to it and sign
-   in. *Unverified* email never matches, because it is attacker-choosable.
-3. **Neither** — if `dash_signups_enabled` is on, create an unapproved `ADMIN`
-   account and show "awaiting approval"; otherwise show "signups are closed".
+1. **Already bound** — the MangaDex account UUID is on an account: sign in. A
+   username change on MangaDex's side follows the account instead of losing it.
+2. **An unclaimed invite for that username** — bind the UUID to it and sign in.
+   A row already bound to a *different* UUID is refused, so releasing a
+   username on MangaDex cannot hand over the account that held it.
+3. **Neither** — self-signup, subject to the group gate above.
 
-Self-signup is **off by default**. Turn it on from **Users → Self-signup**, and
-remember that it only creates accounts — an owner still has to approve each one
-before it can sign in.
+The group check applies on every login, not just the first: someone who leaves
+the group loses access.
 
-Nothing from Discord is persisted beyond id, username and email, and neither
-the authorisation code nor the access token is ever logged.
+Nothing from MangaDex is persisted beyond the account UUID and username. The
+password is forwarded once and discarded, the access token is used for a single
+`/user/me` call and dropped, and neither is ever logged.
 
 ### Gate it with Cloudflare Access
 

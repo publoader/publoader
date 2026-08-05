@@ -469,8 +469,10 @@ and the admin API edits them (`schema.prisma:435-437`).
 | `display_name` | Optional; used as the audit actor when present. |
 | `role` | `OWNER` or `ADMIN`. |
 | `approved` | Self-signups land unapproved (`adminUsers.ts:176-186`); an owner approves. An unapproved account cannot log in even with a correct password (`session.ts:218-221`) and its sessions do not resolve (`adminUsers.ts:227`). |
-| `password_hash` | scrypt `salt:hash`, both hex, N=16384/r=8/p=1, 64-byte key (`adminUsers.ts:22-32`). Null when the account is Discord-only. Compared in constant time. |
-| `discord_id` **unique**, `discord_username` | Discord linkage. A linked `discord_id` *is* the account — an email change on Discord's side must not repoint the login (`api/oauth.ts:53-58`). |
+| `password_hash` | scrypt `salt:hash`, both hex, N=16384/r=8/p=1, 64-byte key (`adminUsers.ts:22-32`). Null when the account is MangaDex-only. Compared in constant time. |
+| `mangadex_id` **unique** | The bound MangaDex account UUID, and *the* identity: a username change on MangaDex's side must not repoint the login (`api/mangadexLogin.ts`). |
+| `mangadex_username` **unique** | The username an OWNER invited, used only to find the row before its UUID is known. A row already bound to a different `mangadex_id` refuses to rebind, so a username changing hands on MangaDex cannot carry the account. |
+| `md_client_id`, `md_client_secret` | That operator's own MangaDex personal API client. MangaDex ships no `authorization_code` flow and a personal client only works for its creator, so each operator brings one. The secret is AES-256-GCM sealed (`api/secretBox.ts`), never stored in the clear, and never returned by any endpoint. |
 | `last_login_at` | Set on session creation. |
 
 **Invariant:** at least one `OWNER` always survives. Both demotion and deletion
