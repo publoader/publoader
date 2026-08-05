@@ -57,20 +57,24 @@ const ConfigSchema = z.object({
   mdPassword: z.string().optional(),
   mdClientId: z.string().optional(),
   mdClientSecret: z.string().optional(),
+  /**
+   * Scanlation group UUIDs whose members may reach the dashboard, comma- or
+   * space-separated. Empty means no group is trusted, which is the *strict*
+   * setting: MangaDex self-signup is refused outright and only accounts an
+   * OWNER invited by username can sign in.
+   */
+  mdAllowedGroupIds: z.string().default(""),
   mdRatelimitMs: z.coerce.number().int().default(2000),
   uploadRetry: z.coerce.number().int().min(1).default(3),
 
   // Discord notifications (core only)
   discordWebhookUrls: z.string().default(""),
 
-  // Dashboard accounts and Discord OAuth (core-api only)
+  // Dashboard accounts (core-api only)
   /** Seeded OWNER account, created idempotently at core-api startup. */
   dashOwnerEmail: z.string().email().default("iam@ardax.dev"),
-  /** Public origin the browser reaches; the OAuth redirect URI is derived. */
+  /** Public origin the browser reaches. */
   dashPublicUrl: z.string().url().default("https://publoader.ardax.dev"),
-  /** Both must be set for the "Login with Discord" button to appear. */
-  discordClientId: z.string().optional(),
-  discordClientSecret: z.string().optional(),
 
   // GitHub push webhook (core-api only). See docs/webhooks.md — CI-side
   // publishing is the preferred alternative to all of this.
@@ -157,13 +161,12 @@ export function loadConfig(overrides: Partial<Record<string, string>> = {}): Con
     mdPassword: get("MANGADEX_PASSWORD"),
     mdClientId: get("MANGADEX_CLIENT_ID"),
     mdClientSecret: get("MANGADEX_CLIENT_SECRET"),
+    mdAllowedGroupIds: get("MANGADEX_ALLOWED_GROUP_IDS"),
     mdRatelimitMs: get("MANGADEX_RATELIMIT_MS"),
     uploadRetry: get("UPLOAD_RETRY"),
     discordWebhookUrls: get("DISCORD_WEBHOOK_URLS"),
     dashOwnerEmail: get("DASH_OWNER_EMAIL"),
     dashPublicUrl: get("DASH_PUBLIC_URL"),
-    discordClientId: get("DISCORD_CLIENT_ID"),
-    discordClientSecret: get("DISCORD_CLIENT_SECRET"),
     githubWebhookSecret: get("GITHUB_WEBHOOK_SECRET"),
     githubRepoOwner: get("GITHUB_REPO_OWNER"),
     githubExtensionsRepos: get("GITHUB_EXTENSIONS_REPOS"),

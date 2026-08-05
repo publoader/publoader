@@ -239,8 +239,7 @@ services:
       GITHUB_CORE_REPO: ${GITHUB_CORE_REPO:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
-      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
-      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      MANGADEX_ALLOWED_GROUP_IDS: ${MANGADEX_ALLOWED_GROUP_IDS:-}
     expose:
       # 8100: the tunnel's origin (API, dashboard, /healthz, /readyz).
       # 8104: /metrics + the same health probes, for Prometheus. Reachable from

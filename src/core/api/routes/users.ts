@@ -52,15 +52,28 @@ export function registerUserRoutes(app: FastifyInstance, ctx: AppContext): void 
 
     scope.post("/api/v1/admin/users", owner, async (req, reply) => {
       const body = z
-        .object({ email: z.string().email().max(320), role: z.enum(ASSIGNABLE_ROLES).default("ADMIN") })
+        .object({
+          email: z.string().email().max(320),
+          role: z.enum(ASSIGNABLE_ROLES).default("ADMIN"),
+          /**
+           * Naming a MangaDex username here is what lets the invitee sign in
+           * with MangaDex. Without it they can only be given a password, since
+           * an uninvited username is refused unless it passes the group gate.
+           */
+          mangadexUsername: z.string().min(1).max(190).optional(),
+        })
         .parse(req.body ?? {});
       if (await ctx.adminUsers.byEmail(body.email)) {
         return reply.code(409).send({ error: "an account with that email already exists" });
       }
-      const user = await ctx.adminUsers.invite(body.email, body.role);
+      if (body.mangadexUsername && (await ctx.adminUsers.byMangadexUsername(body.mangadexUsername))) {
+        return reply.code(409).send({ error: "an account with that MangaDex username already exists" });
+      }
+      const user = await ctx.adminUsers.invite(body.email, body.role, body.mangadexUsername);
       await ctx.audit.record(actor(req), "admin_user.invite", user.id, {
         email: user.email,
         role: user.role,
+        mangadexUsername: user.mangadexUsername,
       });
       return reply.code(201).send({ user: toPublicUser(user) });
     });

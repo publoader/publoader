@@ -11,7 +11,7 @@ Both must move to HTTPS against the core admin API.
 its own copy of the credential: core-api serves it as static assets at the
 domain root (`src/core/api/dashboard/`) and it calls the same
 `/api/v1/admin/*` endpoints as everything else. Operators sign in with their
-own accounts — email + password or Discord — and get a revocable session
+own accounts — email + password or MangaDex — and get a revocable session
 cookie; the admin token is the break-glass path only. The "Dashboard" column
 below is the migration map for the old UI, and it covers every admin endpoint.
 What remains to port is the bot.

@@ -58,12 +58,24 @@ export interface ResolvedSession {
   expiresAt: Date;
 }
 
-export type AdminUserPublic = Omit<AdminUser, "passwordHash"> & { hasPassword: boolean };
+export type AdminUserPublic = Omit<AdminUser, "passwordHash" | "mdClientSecret"> & {
+  hasPassword: boolean;
+  /** Whether this operator has a usable MangaDex personal client stored. */
+  hasMangadexClient: boolean;
+};
 
-/** Never leak the hash to a client, but do say whether one is set. */
+/**
+ * Never leak a secret to a client, but do say whether one is set — the Users
+ * view has to show who can actually get in, and "no credentials" is the state
+ * an owner needs to act on.
+ */
 export function toPublicUser(user: AdminUser): AdminUserPublic {
-  const { passwordHash, ...rest } = user;
-  return { ...rest, hasPassword: passwordHash !== null };
+  const { passwordHash, mdClientSecret, ...rest } = user;
+  return {
+    ...rest,
+    hasPassword: passwordHash !== null,
+    hasMangadexClient: mdClientSecret !== null,
+  };
 }
 
 export class AdminUserStore {
@@ -105,11 +117,21 @@ export class AdminUserStore {
 
   /**
    * Invite: an approved account with no credentials yet. The invitee gets in
-   * by linking Discord or by an owner setting a password for them.
+   * by signing in with the named MangaDex account, or by an owner setting a
+   * password for them.
+   *
+   * Naming the MangaDex username here is what makes "only people we know" real:
+   * an account that was never invited cannot be claimed by a MangaDex login
+   * unless it also passes the scanlation-group gate.
    */
-  invite(email: string, role: AdminRole): Promise<AdminUser> {
+  invite(email: string, role: AdminRole, mangadexUsername?: string): Promise<AdminUser> {
     return this.prisma.adminUser.create({
-      data: { email: email.trim().toLowerCase(), role, approved: true },
+      data: {
+        email: email.trim().toLowerCase(),
+        role,
+        approved: true,
+        mangadexUsername: mangadexUsername?.trim() || null,
+      },
     });
   }
 
@@ -157,28 +179,51 @@ export class AdminUserStore {
     return "ok";
   }
 
-  async linkDiscord(id: string, discordId: string, discordUsername: string): Promise<AdminUser> {
+  // ---- MangaDex identity ----
+
+  /** Bind (or re-bind after a rename) a MangaDex account to an operator row. */
+  async bindMangadex(id: string, mangadexId: string, mangadexUsername: string): Promise<AdminUser> {
     return this.prisma.adminUser.update({
       where: { id },
-      data: { discordId, discordUsername },
+      data: { mangadexId, mangadexUsername: mangadexUsername.trim() },
     });
   }
 
-  byDiscordId(discordId: string): Promise<AdminUser | null> {
-    return this.prisma.adminUser.findUnique({ where: { discordId } });
+  byMangadexId(mangadexId: string): Promise<AdminUser | null> {
+    return this.prisma.adminUser.findUnique({ where: { mangadexId } });
   }
 
-  createFromDiscord(opts: {
-    email: string;
-    discordId: string;
-    discordUsername: string;
-  }): Promise<AdminUser> {
+  byMangadexUsername(mangadexUsername: string): Promise<AdminUser | null> {
+    return this.prisma.adminUser.findUnique({
+      where: { mangadexUsername: mangadexUsername.trim() },
+    });
+  }
+
+  /**
+   * Remember an operator's own personal API client. The secret arrives already
+   * sealed — this store never handles it in the clear, so a stray log of a
+   * write is not a credential leak.
+   */
+  async setMangadexClient(id: string, mdClientId: string, sealedSecret: string): Promise<void> {
+    await this.prisma.adminUser.update({
+      where: { id },
+      data: { mdClientId, mdClientSecret: sealedSecret },
+    });
+  }
+
+  createFromMangadex(opts: { mangadexId: string; username: string }): Promise<AdminUser> {
     // Self-signup lands unapproved and non-privileged by construction.
+    //
+    // MangaDex never gives us an email — the password grant returns an account,
+    // not a contact — but `email` is the table's natural key. A `.invalid`
+    // address (RFC 2606, permanently unresolvable) keeps that key total without
+    // ever pretending to be somewhere mail could be delivered.
     return this.prisma.adminUser.create({
       data: {
-        email: opts.email.trim().toLowerCase(),
-        discordId: opts.discordId,
-        discordUsername: opts.discordUsername,
+        email: `md-${opts.mangadexId}@mangadex.invalid`,
+        mangadexId: opts.mangadexId,
+        mangadexUsername: opts.username.trim(),
+        displayName: opts.username.trim(),
         role: "ADMIN",
         approved: false,
       },

@@ -600,11 +600,28 @@ model AdminUser {
    */
   approved        Boolean        @default(true)
   /**
-   * scrypt "salt:hash" — null when the account is Discord-only.
+   * scrypt "salt:hash" — null when the account is MangaDex-only.
    */
-  passwordHash    String?        @map("password_hash")
-  discordId       String?        @unique @map("discord_id")
-  discordUsername String?        @map("discord_username")
+  passwordHash     String?       @map("password_hash")
+  /**
+   * MangaDex account UUID, bound on the first successful MangaDex login. This
+   * — not the username — is the identity: a username can be changed on
+   * MangaDex's side and must never silently repoint a login.
+   */
+  mangadexId       String?       @unique @map("mangadex_id")
+  /**
+   * The username an OWNER invited, used to find the account *before* its UUID
+   * is known. Once `mangadexId` is bound it takes precedence.
+   */
+  mangadexUsername String?       @unique @map("mangadex_username")
+  /**
+   * The MangaDex personal API client owned by THIS operator. MangaDex has no
+   * authorization_code flow, and a personal client only works for the account
+   * that created it, so every operator brings their own. The secret is sealed
+   * with AES-256-GCM (src/core/api/secretBox.ts), never stored in the clear.
+   */
+  mdClientId       String?       @map("md_client_id")
+  mdClientSecret   String?       @map("md_client_secret")
   lastLoginAt     DateTime?      @map("last_login_at")
   createdAt       DateTime       @default(now()) @map("created_at")
   updatedAt       DateTime       @updatedAt @map("updated_at")

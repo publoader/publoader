@@ -2,7 +2,7 @@
 
 Every endpoint the platform serves, derived from the route files. The server is
 built in [`src/core/api/server.ts`](../src/core/api/server.ts);
-routes live in `src/core/api/routes/`, `session.ts`, `oauth.ts`, and
+routes live in `src/core/api/routes/`, `session.ts`, `mangadexLogin.ts`, and
 `dashboard.ts`.
 
 Only `core-api` serves this API. The other three core services expose a small
@@ -77,7 +77,7 @@ In-process token buckets, keyed per principal (`api/ratelimit.ts`,
 | Enroll | remote IP | 5 | 1/min | `POST /worker/enroll` |
 | Worker | worker id | 60 | 10/s | all authenticated worker routes |
 | Admin | remote IP | 120 | 20/s | all admin routes except `/tokens` |
-| Session | remote IP | 5 | 5/min | `POST /admin/session`, OAuth start |
+| Session | remote IP | 5 | 5/min | `POST /admin/session`, `POST /admin/session/mangadex` |
 
 ### Shared response conventions
 
@@ -480,7 +480,7 @@ from inheriting it by accident (`routes/users.ts:34-37`).
 | `GET` | `/sessions` | Live sessions only — id, actor, email, role, createdAt, expiresAt |
 | `DELETE` | `/sessions/:id` | Force logout. `404` unknown or already revoked |
 | `GET` | `/settings/signups` | `{enabled}` |
-| `POST` | `/settings/signups` | `{enabled}` — the Discord self-signup gate, off unless turned on |
+| `POST` | `/settings/signups` | `{enabled}` — the MangaDex self-signup gate, off unless turned on, and inert unless `MANGADEX_ALLOWED_GROUP_IDS` names a group |
 
 `routes/users.ts:41-143`, tested at
 `test/integration/dashboard.test.ts:184`.
@@ -494,17 +494,24 @@ their own per-IP limiter (`session.ts:137-141`).
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/api/v1/admin/session/methods` | none | `{discord, signups, password}` — which login methods to render. Safe to leave open: everything it reports is visible from the login page anyway |
+| `GET` | `/api/v1/admin/session/methods` | none | `{mangadex, signups, password}` — which login methods to render. `signups` is true only when `MANGADEX_ALLOWED_GROUP_IDS` is set *and* the toggle is on. Safe to leave open: everything it reports is visible from the login page anyway |
 | `POST` | `/api/v1/admin/session` | none — **this is** the authentication | Two shapes. `{token, actor?}` is the break-glass path and attaches a session to the seeded owner. `{email, password}` is the normal path. Sets an `HttpOnly; SameSite=Strict` cookie and returns `{ok, actor, role, email, expiresAt}` |
 | `GET` | `/api/v1/admin/session` | cookie | Who am I → `{actor, role, userId, email, hasPassword}`. The cookie is HttpOnly, so a reloaded page has to ask. **`401`** with no active session |
 | `DELETE` | `/api/v1/admin/session` | cookie | Revokes the session row and clears the cookie. Always `200` |
-| `GET` | `/api/v1/admin/oauth/discord/start` | none | Redirects to Discord with a signed, `SameSite=Lax`, 10-minute state nonce. **`503`** when no OAuth app is configured; **`429`** rate limited. Answers HTML, not JSON |
-| `GET` | `/api/v1/admin/oauth/discord/callback` | none | Completes the exchange and issues a session, then `302` to `/`. Answers a small HTML notice page on every failure: `400` missing code or replayed/expired state, `403` no verified email / signups closed, `502` exchange failed, `200` "awaiting approval" |
+| `POST` | `/api/v1/admin/session/mangadex` | none — **this is** the authentication | `{username, password, clientId?, clientSecret?}`. Makes a `password` grant against MangaDex on the caller's behalf (MangaDex has no `authorization_code` flow), resolves `/user/me`, and issues the same cookie and body as `POST /session`. `clientId`/`clientSecret` are needed only until an account has a client stored; they are then kept encrypted |
 
 Failure statuses on the password path: **`401`** with one message for both "no
 such account" and "wrong password"; **`403` account is awaiting approval**;
 **`429` too many login attempts**; **`503`** when `ADMIN_TOKEN` is unset and a
 token login was attempted. Every rejection is audited with the source IP.
+
+Failure statuses on the MangaDex path: **`400`** with `{needsClient: true}` when
+the account has no personal API client stored and none was supplied — that flag
+is what makes the dashboard reveal the client fields; **`401`** with one message
+for bad credentials, a client that is not yours, *and* an unknown account, so
+the endpoint never confirms which MangaDex usernames are operators; **`403`**
+not in an allowed scanlation group / signups closed / awaiting approval;
+**`429`** rate limited.
 
 The session cookie is `publoader_session` = `${sessionId}.${secret}`; the
 `admin_sessions` row is the authority, which is what makes one session revocable
@@ -512,11 +519,12 @@ without signing everyone else out (`store/adminUsers.ts:190-210`). `Secure` is
 inferred per request from `x-forwarded-proto`, or forced with
 `SESSION_COOKIE_SECURE=true`.
 
-Discord identity resolution is deliberately ordered — a linked `discord_id` is
-the account; otherwise a **verified** email may claim an existing account;
-otherwise it is a gated signup that always lands unapproved
-(`api/oauth.ts:49-105`, unit-tested at
-`test/unit/discordOauth.test.ts`).
+MangaDex identity resolution is deliberately ordered — a bound `mangadex_id` is
+the account; otherwise an **unclaimed** invite for that username may be claimed,
+which is what stops a username changing hands on MangaDex from carrying the
+account with it; otherwise it is a group-gated signup that always lands
+unapproved (`api/mangadexLogin.ts`, unit-tested at
+`test/unit/mangadexLogin.test.ts`).
 
 ---
 

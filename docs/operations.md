@@ -31,9 +31,9 @@ Everything in this document can also be done from a browser at
 so the CLI remains authoritative and the two are interchangeable — every
 dashboard action lands in `padmin audit` exactly like a CLI one.
 
-**Sign in** with your email and password, or with Discord if this deployment
-has OAuth configured. Your account name becomes the audit actor, so "who paused
-the platform" is answerable without anyone having to set a header.
+**Sign in** with your email and password, or with your MangaDex account. Your
+account name becomes the audit actor, so "who paused the platform" is
+answerable without anyone having to set a header.
 
 If you have no account yet, or nobody does — a fresh database seeds one `OWNER`
 (`DASH_OWNER_EMAIL`) with no credentials — use **"Use the admin token
@@ -41,8 +41,8 @@ instead"** on the login page, then **Users → Set password**. That is the
 bootstrap path and the break-glass path both.
 
 Sessions last `SESSION_TTL_MINUTES` (12h default) and are individually
-revocable from **Users → Live sessions**. Full setup, including the Discord
-OAuth application, is in `docs/deployment.md` → "Dashboard"; a tour of every
+revocable from **Users → Live sessions**. Full setup, including what MangaDex
+login does and does not give you, is in `docs/deployment.md` → "Dashboard"; a tour of every
 section, the role matrix, and the short list of things that still need a shell
 on the host is in `docs/dashboard.md`.
 
@@ -64,15 +64,21 @@ trust — deletion is.
 
 ### Approving a new operator
 
-With self-signup on (**Users → Self-signup**), a Discord login by someone
-unknown creates an unapproved `ADMIN` row and shows them "awaiting approval".
-Nothing else happens until you act: they cannot sign in, and no endpoint is
-reachable. Approve from **Users**, or leave it and delete the row.
+With self-signup on (**Users → Self-signup**) *and* `MANGADEX_ALLOWED_GROUP_IDS`
+naming a scanlation group, a MangaDex login by an unknown member of that group
+creates an unapproved `ADMIN` row and shows them "awaiting approval". Nothing
+else happens until you act: they cannot sign in, and no endpoint is reachable.
+Approve from **Users**, or leave it and delete the row.
 
-With self-signup off (the default), an unknown Discord login is refused
-outright. Invite them instead — **Users → Invite** with their email — and they
-get in by linking Discord with that same verified email, or by you setting a
-password for them.
+With self-signup off (the default), or with no group allowlisted, an unknown
+MangaDex login is refused outright. Invite them instead — **Users → Invite**
+with their email *and their MangaDex username* — and they get in by signing in
+with that MangaDex account, or by you setting a password for them.
+
+Either way they need their own MangaDex personal API client: MangaDex has no
+`authorization_code` flow, and a personal client only works for the account
+that created it. They create one at **mangadex.org → Settings → API Clients**,
+wait for MangaDex staff to approve it, and enter it once at first login.
 
 ### Onboard a community contributor
 
@@ -83,7 +89,7 @@ audit log, or change where an existing mapping points.
 
 ```
 Users → Invite → their email, role CONTRIBUTOR
-Users → their row → Set password        # or let them link Discord
+Users → their row → Set password        # or invite with their MangaDex username
 ```
 
 Their dashboard has three sections (Overview, Extensions — with the series map
@@ -506,10 +512,12 @@ To sign *everyone* out there is no single lever: revoke each session under
 psql "$DATABASE_URL" -c "UPDATE admin_sessions SET revoked = true"
 ```
 
-Rotating `SESSION_SECRET` does not log anyone out — it signs the OAuth state
-cookie only, so rotating it breaks Discord logins that are mid-flight and
-nothing else. Rotating `ADMIN_TOKEN` likewise leaves existing sessions alive,
-including any created with the old token.
+Rotating `SESSION_SECRET` does not log anyone out — sessions are database rows.
+What it does break is the stored MangaDex client secrets it keys: each operator
+is asked for theirs again at the next MangaDex login. Rotating `ADMIN_TOKEN`
+likewise leaves existing sessions alive, including any created with the old
+token, and has the same effect on stored client secrets when `SESSION_SECRET`
+is unset.
 
 ### Worker token
 

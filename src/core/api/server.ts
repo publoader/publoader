@@ -9,7 +9,7 @@ import { registerQueueRoutes } from "./routes/queues.js";
 import { registerSysopsRoutes } from "./routes/sysops.js";
 import { registerWebhookRoutes } from "./routes/webhooks.js";
 import { registerSessionRoutes } from "./session.js";
-import { registerOAuthRoutes } from "./oauth.js";
+import { registerMangadexLoginRoutes } from "./mangadexLogin.js";
 import { registerUserRoutes } from "./routes/users.js";
 import { registerDashboardRoutes } from "./dashboard.js";
 
@@ -98,7 +98,7 @@ export function buildServer(ctx: AppContext): FastifyInstance {
   // they register outside the admin scope and guard themselves with the
   // per-IP login limiter.
   registerSessionRoutes(app, ctx);
-  registerOAuthRoutes(app, ctx);
+  registerMangadexLoginRoutes(app, ctx);
   registerAdminRoutes(app, ctx);
   registerTokenRoutes(app, ctx);
   registerOpsRoutes(app, ctx);
