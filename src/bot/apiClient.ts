@@ -312,6 +312,21 @@ export interface ArchiveSeriesReport {
   capped: boolean;
 }
 
+/** What a series re-check would cover, and the run it started if it did. */
+export interface SeriesRecheck {
+  dryRun: boolean;
+  extension: string;
+  mangaId: string;
+  removalMode: string;
+  onMangadex: number | null;
+  carded: number | null;
+  candidates: number | null;
+  publishesCatalogue: boolean;
+  runId?: string;
+  created?: boolean;
+  note: string;
+}
+
 export interface ChapterReconcileReport {
   dryRun: boolean;
   groups: {
@@ -584,6 +599,32 @@ export class AdminApiClient {
       // Autocomplete calls this on the keystroke and Discord closes the window
       // at three seconds; a slow answer is worth abandoning, not waiting for.
       timeoutMs: 2500,
+    });
+  }
+
+  /**
+   * Start a run that asks the publisher whether one series is still there.
+   *
+   * Unlike the re-card, this one the bot can actually do: it creates a run, and
+   * run creation is not closed to api tokens — a `pa_…` token with `runs:write`
+   * has been able to trigger a whole-catalogue CLEAN through `/run` all along,
+   * and this is the same thing narrowed to one title.
+   */
+  recheckSeries(
+    actor: string,
+    opts: { mdMangaId: string; extension?: string | undefined; apply: boolean; idempotencyKey?: string },
+  ): Promise<SeriesRecheck> {
+    return this.request({
+      method: "POST",
+      path: `/api/v1/admin/chapters/series/${encodeURIComponent(opts.mdMangaId)}/recheck`,
+      scope: "runs:write",
+      actor,
+      json: {
+        ...(opts.extension ? { extension: opts.extension } : {}),
+        dryRun: !opts.apply,
+        confirm: opts.apply,
+        ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
+      },
     });
   }
 

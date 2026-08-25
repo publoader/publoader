@@ -845,6 +845,65 @@ chapters
     },
   );
 
+/**
+ * Ask the publisher whether a series' chapters are still there.
+ *
+ * The sibling of `recard`, and the question that comes before it: `recard`
+ * re-renders the card on a chapter already known to be gone, this finds out
+ * whether it is gone. It cannot answer synchronously — reading the publisher
+ * happens on a worker running the extension — so it starts a run scoped to the
+ * one series and reports where to watch it.
+ */
+chapters
+  .command("recheck <mdMangaId>")
+  .description("ask the publisher whether one series' chapters are still there, and mark what is not")
+  .option("--extension <name>", "which extension to ask, when more than one tracks the title")
+  .option("--apply", "start the run (default is a dry run that starts nothing)")
+  .action(async (mdMangaId: string, opts: { extension?: string; apply?: boolean }) => {
+    const res = await api<{
+      dryRun: boolean;
+      extension: string;
+      mangaId: string;
+      removalMode: string;
+      onMangadex: number | null;
+      carded: number | null;
+      candidates: number | null;
+      publishesCatalogue: boolean;
+      runId?: string;
+      created?: boolean;
+      note: string;
+    }>(`/api/v1/admin/chapters/series/${mdMangaId}/recheck`, {
+      method: "POST",
+      json: {
+        ...(opts.extension ? { extension: opts.extension } : {}),
+        dryRun: opts.apply !== true,
+        confirm: opts.apply === true,
+      },
+    });
+
+    kv({
+      extension: res.extension,
+      publisherId: res.mangaId,
+      onMangadex: res.onMangadex ?? "unknown (no MangaDex credentials on the API)",
+      alreadyCarded: res.carded ?? "-",
+      couldBeMarked: res.candidates ?? "-",
+      removalMode: res.removalMode,
+      ...(res.runId ? { runId: res.runId, created: res.created } : {}),
+    });
+    if (!res.publishesCatalogue) {
+      console.error(
+        `  warning: ${res.extension} has not sent a full catalogue listing recently; ` +
+          "removal detection needs one, so this may find nothing",
+      );
+    }
+    ok(
+      res.dryRun
+        ? `${res.note} Re-run with --apply to start it.`
+        : `run ${res.runId} queued; watch it with \`padmin runs show ${res.runId}\`, ` +
+            "then the UNAVAILABLE queue",
+    );
+  });
+
 // ---- extension config (the database replacement for override_options.json) ----
 const extConfig = program
   .command("ext-config")

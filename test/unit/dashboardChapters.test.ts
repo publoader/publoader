@@ -181,6 +181,26 @@ function apiRoutes(): { match: RegExp; body: unknown | ((init?: { body?: string 
     },
     { match: /\/chapters\/extensions/, body: { table: "uploaded", extensions: [{ extension: "mangaplus", count: 902 }] } },
     {
+      // Ordered before the series listing: its path starts the same way.
+      match: /\/chapters\/series\/[^/]+\/recheck/,
+      body: (init?: { body?: string }) => {
+        const sent = JSON.parse(init?.body ?? "{}");
+        return {
+          dryRun: sent.dryRun !== false,
+          action: "RECHECK",
+          extension: "mangaplus",
+          mangaId: "100191",
+          removalMode: "unavailable",
+          onMangadex: 41,
+          carded: 3,
+          candidates: 38,
+          publishesCatalogue: true,
+          ...(sent.dryRun === false ? { ok: true, runId: "run-recheck-1", created: true } : {}),
+          note: "note",
+        };
+      },
+    },
+    {
       match: /\/chapters\/series/,
       body: {
         archive: "unavailable",
@@ -617,8 +637,13 @@ describe("dashboard chapter views", () => {
     it("lists the titles with cards up, largest first", async () => {
       await goto("#/system/cards");
       await pickSeriesMode();
-      expect(requested.some((path) => path.includes("/chapters/series?"))).toBe(true);
-      expect(requested.some((path) => path.includes("archive=unavailable"))).toBe(true);
+      // The unavailable archive specifically: the re-check panel on the same
+      // tab asks the same endpoint about the uploaded one.
+      expect(
+        requested.some(
+          (path) => path.includes("/chapters/series?") && path.includes("archive=unavailable"),
+        ),
+      ).toBe(true);
       const view = text();
       expect(view).toContain("Sakamoto Days");
       // The count is the reason to pick this title over another one.
@@ -690,6 +715,89 @@ describe("dashboard chapter views", () => {
         filter: { extension: "mangaplus", mdMangaId: MD_MANGA },
         dryRun: true,
       });
+    });
+  });
+
+  /**
+   * The re-check panel, which shares the tab with the re-card one.
+   *
+   * It is the question before a card exists: a run only visits series that
+   * published something, so a quiet series can lose its back catalogue with
+   * nothing noticing. The property worth holding is that the panel never starts
+   * a run without an explicit confirmation, and never starts one at all from
+   * the preview button.
+   */
+  describe("re-checking a series at the publisher", () => {
+    const click = (label: string): void => {
+      const button = [...doc.querySelectorAll("button")].find(
+        (b: { textContent: string }) => b.textContent === label,
+      );
+      expect(button, `no button labelled ${label}`).toBeTruthy();
+      button.click();
+    };
+
+    const recheckCalls = () =>
+      win.fetch.mock.calls.filter(([url]: [string]) => String(url).includes("/recheck"));
+
+    const pickSeries = async (): Promise<void> => {
+      const pick = doc.querySelector('#view input[type="radio"][name="recheck-series-pick"]');
+      expect(pick, "no series to pick").toBeTruthy();
+      pick.checked = true;
+      pick.dispatchEvent(new win.Event("change"));
+      await settle();
+    };
+
+    it("lists published series, not just the ones with cards up", async () => {
+      await goto("#/system/cards");
+      expect(text()).toContain("Re-check a series at the publisher");
+      // The uploaded archive: a series worth re-checking need not have anything
+      // marked unavailable yet.
+      expect(
+        requested.some(
+          (path) => path.includes("/chapters/series?") && path.includes("archive=uploaded"),
+        ),
+      ).toBe(true);
+    });
+
+    it("reports what a re-check would cover without starting one", async () => {
+      await goto("#/system/cards");
+      await pickSeries();
+
+      click("What would this cover?");
+      await settle();
+
+      const [url, init] = recheckCalls()[0];
+      expect(String(url)).toContain(`/chapters/series/${MD_MANGA}/recheck`);
+      // A preview names the extension to ask and starts nothing.
+      expect(JSON.parse(init.body)).toEqual({ extension: "mangaplus", dryRun: true });
+      const view = text();
+      expect(view).toContain("mangaplus");
+      expect(view).toContain("38");
+      expect(view).toContain("Nothing has been started");
+    });
+
+    it("starts the run only after the confirmation", async () => {
+      await goto("#/system/cards");
+      await pickSeries();
+
+      click("Start the re-check…");
+      await settle();
+      // Still nothing sent: the dialog stands between the click and the run.
+      expect(recheckCalls()).toHaveLength(0);
+
+      click("Start the re-check");
+      await settle(20);
+
+      const live = recheckCalls().filter(
+        ([, init]: [string, { body: string }]) => JSON.parse(init.body).dryRun === false,
+      );
+      expect(live).toHaveLength(1);
+      expect(JSON.parse(live[0][1].body)).toEqual({
+        extension: "mangaplus",
+        dryRun: false,
+        confirm: true,
+      });
+      expect(text()).toContain("run-recheck-1");
     });
   });
 });

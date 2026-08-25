@@ -1223,6 +1223,57 @@ curl -s -X POST -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: applic
   "$API/api/v1/admin/chapters/$MD_CHAPTER_ID/unavailable"
 ```
 
+### Ask whether a series is still on the publisher
+
+Nothing on this platform notices a chapter being pulled from the publisher except
+a run, and a run only visits series that reported an update. A series that has
+been quiet for a year can lose its back catalogue with nobody hearing about it,
+and re-carding will not find it: that re-renders the page of a chapter *already*
+known to be gone. This is how to ask whether it is gone.
+
+**Dashboard → System → Unavailable cards → Re-check a series at the publisher.**
+Pick the series, read what it would cover, start it. From a terminal:
+
+```bash
+# what would this ask, and of whom
+padmin chapters recheck "$MD_MANGA_ID"
+
+# ask it
+padmin chapters recheck "$MD_MANGA_ID" --apply
+```
+
+`/recheck series:<name>` does the same from Discord, and needs `confirm: true`
+before it starts anything.
+
+The answer does not come back in the response. Reading the publisher happens on a
+worker running the extension, so this starts a run and hands back its id; the
+processor then compares the extension's current listing against what MangaDex
+holds under our group and queues the difference as `UNAVAILABLE` or `DELETE`, per
+the removal mode. Watch it as `padmin runs show <id>`, then the `UNAVAILABLE`
+queue.
+
+Three things worth knowing before you run it:
+
+- **The run is scoped, and that is load-bearing.** It is a CLEAN run — the
+  contract's way of asking an extension for its full listing — narrowed to one
+  title and recorded as such in `runs.scope_manga_ids`. The processor reads that
+  and skips the two passes that treat a tracked title's absence from a snapshot
+  as "the publisher dropped it". Those passes are correct for a whole-catalogue
+  run and would unpublish everything else for a one-series one.
+- **An extension that publishes no catalogue listing cannot be re-checked.**
+  Removal detection is a comparison, and there is nothing to compare against if
+  the extension only ever reports its updates. The dry run says so when the
+  extension's recent runs carried no snapshot; running it anyway harms nothing
+  and finds nothing.
+- **Chapters already carrying our card are never candidates.** Marking one
+  unavailable repointed its `externalUrl` away from the publisher, so it can
+  never look "still listed" — it is excluded rather than re-queued for ever.
+
+A title an extension keeps in a named catalogue (viz's `shonenjump` and
+`vizmanga`) is refused with a 409: a run's manga subset travels to the worker as
+a bare id, which cannot say which catalogue it belongs to. Re-check the whole
+extension with `padmin runs trigger <ext> --kind CLEAN` instead.
+
 ### Re-post the cards already on MangaDex
 
 A card is rendered at the moment it is posted, so every card in the catalogue is

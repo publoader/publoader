@@ -608,6 +608,7 @@ not a fourth flag on the bulk ones:
 | Method | Path | Scope | Notes |
 | --- | --- | --- | --- |
 | `POST` | `/chapters/unavailable/recard` | `chapters:write` + ADMIN | `{ids?, filter?, footerNote?, dryRun?, confirm?, afterId?, batch?}`. Always the `unavailable` archive and always forced. A chapter with no card refuses as `not_unavailable` rather than being carded for the first time |
+| `POST` | `/chapters/series/:mdMangaId/recheck` | `runs:write` | `{extension?, dryRun?, confirm?, idempotencyKey?}`. Asks the publisher whether one series' chapters are still there, by starting a run scoped to it; the processor queues whatever MangaDex still holds that the extension no longer lists, as `UNAVAILABLE` or `DELETE` per the removal mode. `409` when several extensions track the title and none is named, or when the title's external id lives in a named catalogue (a run's manga subset travels as a bare id and cannot name one) |
 | `GET` | `/chapters/series` | `chapters:read` | `?archive=&extension=&language=&search=&limit=`. The titles present in one archive, most-affected first: `{mdMangaId, mangaName, extensions[], count, at}` plus `capped`. Aims the `mdMangaId` filter above; read-only, so unlike the re-card itself it is reachable on a `pa_…` token |
 
 It exists because the bulk route gets two things wrong for a re-render:
@@ -634,8 +635,36 @@ else matches the bulk contract: `ids` XOR `filter`, `dryRun` defaulting to true,
 live run needing `dryRun: false` **and** `confirm: true`, one audit row per chapter
 (`chapter.unavailable.recard`) plus a `chapter.unavailable.recard.sweep` summary.
 
+### Re-checking a series at the publisher
+
+The re-card above re-renders the page of a chapter already known to be gone.
+`POST /chapters/series/:mdMangaId/recheck` asks the question before it — *is* it
+gone — which nothing else asks on demand: removals are noticed by runs, and a run
+only visits series that reported an update, so a series that has been quiet for a
+year can lose its back catalogue silently.
+
+It cannot answer in the response. Reading the publisher happens on a worker
+running the extension, so the endpoint starts a run and reports where to watch
+it. The run is **CLEAN**, because that is how the extension contract asks for a
+full catalogue listing (`allChapters`), which is the only thing removal detection
+can be computed from; and it is **scoped** (`runs.scope_manga_ids`), because the
+processor must not read the resulting snapshot as a statement about the whole
+catalogue. Without that flag this endpoint would unpublish every title the run
+never asked about.
+
+The dry run is worth reading first: it names the extension that will be asked,
+how many chapters MangaDex holds under our group for the title, how many of those
+already carry a card (and are therefore never candidates), and whether that
+extension has sent a full listing in its recent runs at all — an extension that
+reports only its updates can never say that something is missing, and a re-check
+against one will honestly find nothing.
+
+Gated as a run rather than as a chapter write: it starts the same machinery
+`POST /runs` does, narrowed to one title, so an api token with `runs:write` may
+call it exactly as it may trigger a whole-catalogue CLEAN.
+
 `routes/chapters.ts`, `store/chapters.ts`, tested at
-`test/integration/chapters.test.ts`.
+`test/integration/chapters.test.ts` and `test/integration/scopedRun.test.ts`.
 
 ### MangaDex session
 

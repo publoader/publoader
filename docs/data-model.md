@@ -118,7 +118,7 @@ unblocks uploads (`src/core/md/titleService.ts:125-138`).
 | --- | --- | --- |
 | `WorkerStatus` | `ACTIVE`, `DRAINED`, `REVOKED` | `DRAINED` still authenticates but gets 204 + `x-publoader-drained` on lease (`routes/worker.ts:89-92`); `REVOKED` fails authentication outright (`store/workers.ts:87`). |
 | `TrustTier` | `TRUSTED`, `COMMUNITY` | Worker capability floor; see [trust tier](glossary.md). |
-| `RunKind` | `UPDATE`, `CLEAN`, `FORCE` | `UPDATE` is the scheduled kind. `CLEAN` asks the extension for its full catalogue so removals can be computed, and is never partitioned. `FORCE` is the default for a manual trigger (`routes/admin.ts:104`). |
+| `RunKind` | `UPDATE`, `CLEAN`, `FORCE` | `UPDATE` is the scheduled kind. `CLEAN` asks the extension for its full catalogue so removals can be computed, and is never partitioned — a *scoped* run (`scope_manga_ids`) is CLEAN for the same reason and is one job by construction, not a partition of one. `FORCE` is the default for a manual trigger (`routes/admin.ts:104`). |
 | `ErrorClass` | `TRANSIENT`, `PERMANENT`, `POLICY` | Decides retry vs immediate dead-letter. `PERMANENT` dead-letters at once; `TRANSIENT` and `POLICY` requeue with backoff until `maxAttempts` (`store/jobs.ts:246-268`). `POLICY` is written only by ingest, for a manifest or tracked-map violation. |
 | `UploadTaskKind` | `UPLOAD`, `EDIT`, `DELETE`, `UNAVAILABLE` | Drained in the order `DELETE, EDIT, UPLOAD, UNAVAILABLE` (`services/uploader.ts:28`) so a chapter removed upstream never races the re-upload of its replacement. |
 | `UploadOutcome` | `COMMITTING`, `COMMITTED`, `FAILED` | The `upload_logs` bracket around an upload. |
@@ -172,6 +172,7 @@ checking the affected count; not by a read-then-write. Tested at
 | `extension`, `extension_version`, `bundle_sha256` | The version pin, copied onto every job. A run's jobs cannot drift onto a different bundle. |
 | `kind`, `state` | See enums. |
 | `segments_total` | How many jobs this run has. |
+| `scope_manga_ids` | Empty for a run over the whole catalogue. Non-empty names the MangaDex titles this run deliberately looked at, and *only* those: its `allChapters` snapshot then means "everything the publisher has for these titles" and is silent about the rest. The processor reads it to skip the two catalogue-wide removal passes, without which a one-series re-check would unpublish every title it never asked about (`processor/processor.ts`, `test/integration/scopedRun.test.ts`). |
 | `require_all_segments` | Stored (default true) but **not currently read** by the processor, which instead refuses to process a `CLEAN` run with missing segments and skips only the removal passes for other kinds (`processor/processor.ts:144-146`, `258-269`). |
 | `triggered_by` | Audit provenance: `"scheduler"`, or the acting principal for a manual run. |
 | `scheduled_for` | The slot this run was created for; null for manual runs. |

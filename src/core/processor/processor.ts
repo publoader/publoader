@@ -45,6 +45,18 @@ interface ClaimedRun {
   extension: string;
   bundleSha256: string;
   kind: "UPDATE" | "CLEAN" | "FORCE";
+  /**
+   * MangaDex title ids this run was deliberately limited to, empty for a run
+   * over the whole catalogue.
+   *
+   * The distinction is not cosmetic and cannot be inferred from the envelopes.
+   * `allChapters` means "this is everything the publisher has"; on a scoped run
+   * it means "this is everything the publisher has FOR THESE TITLES", and is
+   * silent about the rest. The catalogue-wide removal passes read silence as
+   * absence, so running them against a scoped snapshot would unpublish every
+   * title the run never asked about.
+   */
+  scopeMangaIds: string[];
 }
 
 export interface MergedResults {
@@ -213,7 +225,8 @@ export class RunProcessor {
       SET updated_at = now()
       FROM candidate
       WHERE r.id = candidate.id
-      RETURNING r.id, r.extension, r.bundle_sha256 AS "bundleSha256", r.kind
+      RETURNING r.id, r.extension, r.bundle_sha256 AS "bundleSha256", r.kind,
+                r.scope_manga_ids AS "scopeMangaIds"
     `);
     return rows[0] ?? null;
   }
@@ -259,15 +272,32 @@ export class RunProcessor {
 
     await this.persistUntrackedManga(run.extension, merged.untrackedManga, log);
 
+    const scope = new Set(run.scopeMangaIds);
+    const scoped = scope.size > 0;
+
     // Without this the channel only hears about individual uploads, which says
     // nothing on a run that found nothing.
-    await this.reportRunSummary(run.extension, merged.untrackedManga, merged.updatedChapters.length);
+    //
+    // Except on a scoped run: "no updates from mangaplus" is a claim about the
+    // extension's sweep, and an operator probing one series has not made it.
+    // The removals this run queues still announce themselves as they upload.
+    if (scoped) {
+      log.info(
+        { scope: [...scope], updated: merged.updatedChapters.length },
+        "scoped run: not announcing a run summary for a probe of part of the catalogue",
+      );
+    } else {
+      await this.reportRunSummary(run.extension, merged.untrackedManga, merged.updatedChapters.length);
+    }
 
     const updatedByManga = groupByMdManga(merged.updatedChapters);
     const allByManga = merged.allChapters === null ? null : groupByMdManga(merged.allChapters);
     const trackedIds = new Set(merged.trackedMangadexIds);
 
-    await this.resolveMangaNames([...updatedByManga.keys()]);
+    // The scope is included even where it has no updates: a removal queued for
+    // a dormant title still prints the title's name on its card, and an
+    // unresolved name would put a blank there.
+    await this.resolveMangaNames([...new Set([...updatedByManga.keys(), ...scope])]);
     applyMangaNames(updatedByManga, this.mangaNames);
     if (allByManga) applyMangaNames(allByManga, this.mangaNames);
 
@@ -275,7 +305,23 @@ export class RunProcessor {
     const chaptersOnMdByManga = new Map<string, MdChapter[]>();
     const totals = { upload: 0, edit: 0, skip: 0, remove: 0 };
 
-    for (const [mangaId, updatedChapters] of updatedByManga) {
+    // Normally the manga worth visiting are the ones with updates: with no new
+    // chapter there is nothing to upload, and a run that reported no snapshot
+    // has nothing to remove either.
+    //
+    // A scoped run is the exception, and it is the whole point of one. "Is this
+    // series still on the publisher?" is asked precisely about series that have
+    // published nothing lately, and the answer lives in `allChapters`, not in
+    // the updates. Visiting the scope regardless is what lets a re-check of a
+    // dormant title find the chapters that were pulled from under it.
+    const visiting: [string, Chapter[]][] = [...updatedByManga];
+    if (scoped) {
+      for (const mangaId of scope) {
+        if (!updatedByManga.has(mangaId)) visiting.push([mangaId, []]);
+      }
+    }
+
+    for (const [mangaId, updatedChapters] of visiting) {
       const chaptersOnMd = await this.md.chaptersForManga(mangaId, groupId);
       for (const mdChapter of chaptersOnMd) {
         const owner = mdChapterMangaId(mdChapter) ?? mangaId;
@@ -342,8 +388,14 @@ export class RunProcessor {
 
     // "Untracked" is derived from the union of every segment's tracked ids, so
     // a segment that never committed could make a perfectly tracked manga look
-    // orphaned. Only run the pass on a complete picture.
-    if (missingJobs === 0) {
+    // orphaned. Only run the pass on a complete picture — and a scoped run is
+    // never a complete picture by construction.
+    if (scoped) {
+      log.info(
+        { scope: [...scope] },
+        "scoped run: skipping the catalogue-wide cleanup passes, which this run's snapshot cannot support",
+      );
+    } else if (missingJobs === 0) {
       totals.remove += await this.removeUntrackedManga(
         chaptersOnMdByManga,
         trackedIds,
@@ -356,7 +408,7 @@ export class RunProcessor {
       log.warn({ missingJobs }, "skipping untracked-manga cleanup: incomplete segment coverage");
     }
 
-    if (run.kind === "CLEAN" && allByManga !== null) {
+    if (!scoped && run.kind === "CLEAN" && allByManga !== null) {
       totals.remove += await this.removeMangaWithoutExternalChapters(
         merged.trackedMangadexIds,
         allByManga,
@@ -367,7 +419,15 @@ export class RunProcessor {
       );
     }
 
-    const dupes = await this.deleteDuplicates(run, merged, updatedByManga, groupId, log);
+    const dupes = await this.deleteDuplicates(
+      run,
+      merged,
+      // Same reason: on a scoped run the tracked-id fallback below would walk
+      // the whole catalogue looking for duplicates the run never looked at.
+      scoped ? new Map(visiting) : updatedByManga,
+      groupId,
+      log,
+    );
 
     log.info({ ...totals, dupes }, "run processed");
     await this.markProcessed(run.id, log);
@@ -653,11 +713,13 @@ export class RunProcessor {
     log: Logger,
   ): Promise<number> {
     const mangaIds =
-      run.kind === "CLEAN"
-        ? merged.trackedMangadexIds
-        : updatedByManga.size > 0
-          ? [...updatedByManga.keys()]
-          : merged.trackedMangadexIds;
+      run.scopeMangaIds.length > 0
+        ? run.scopeMangaIds
+        : run.kind === "CLEAN"
+          ? merged.trackedMangadexIds
+          : updatedByManga.size > 0
+            ? [...updatedByManga.keys()]
+            : merged.trackedMangadexIds;
 
     const languages = new Set(merged.languages);
     const multiChapters = merged.overrideOptions.multi_chapters ?? {};

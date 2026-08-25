@@ -275,6 +275,7 @@ as the legacy `force_login` without a chat command that handles a password.
 | `/tracked set <extension> <manga-id> <md-manga-id>` | mutate | `extensions:write` | Add or repoint a mapping. |
 | `/tracked remove <extension> <manga-id>` | mutate | `extensions:write` | Stop tracking. Does not touch MangaDex. |
 | `/reconcile [extension]` | read | `chapters:read` | How many chapters are already marked unavailable on MangaDex, or deleted, that the archives do not know about. **Reports only**; applying is closed to api tokens, so recording them is `padmin chapters reconcile --apply` or the dashboard. |
+| `/recheck series [extension] [confirm]` | mutate | `runs:write` | Asks the publisher whether one series' chapters are still there, and queues whatever it no longer lists as UNAVAILABLE (or DELETE). Reports without starting anything until `confirm: true`. Unlike `/recard` the bot **can** do this one: it creates a run, and run creation is not closed to api tokens. |
 | `/recard [series] [extension]` | read | `chapters:read` | Which titles have unavailable card images up and how many each has, autocompleted from the archive. Naming one title answers with the line that re-posts its cards. **Reports only**, for the same reason: posting card images is closed to api tokens, so the work happens on the dashboard or through `padmin chapters recard --series … --apply`. |
 
 `/extensions list` shows **published bundles**, not files on disk. An extension

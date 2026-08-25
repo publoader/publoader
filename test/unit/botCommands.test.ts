@@ -1143,3 +1143,81 @@ describe("recard", () => {
     expect(resolveSensitivity(COMMANDS_BY_NAME.get("recard")!, null)).toBe("read");
   });
 });
+
+
+/**
+ * `/recheck`: the question before a card exists.
+ *
+ * Unlike `/recard`, this one the bot can actually do — it creates a run, and
+ * run creation is not closed to api tokens. So the guard that matters is the
+ * confirmation: the reply must report without starting anything until asked.
+ */
+describe("recheck", () => {
+  const MD_MANGA = "9a1b1c1d-0000-4000-8000-000000000000";
+  const report = (over: Record<string, unknown> = {}) => ({
+    dryRun: true,
+    extension: "mangaplus",
+    mangaId: "100191",
+    removalMode: "unavailable",
+    onMangadex: 41,
+    carded: 3,
+    candidates: 38,
+    publishesCatalogue: true,
+    note: "note",
+    ...over,
+  });
+
+  it("reports what it would cover and starts nothing", async () => {
+    const recheckSeries = vi.fn().mockResolvedValue(report());
+    const reply = await invoke("recheck", fakeApi({ recheckSeries }), { series: MD_MANGA });
+
+    expect(recheckSeries).toHaveBeenCalledWith("discord:ardax", {
+      mdMangaId: MD_MANGA,
+      extension: undefined,
+      apply: false,
+      idempotencyKey: "discord:interaction-1",
+    });
+    expect(reply.text).toContain("mangaplus");
+    expect(reply.text).toContain("38");
+    expect(reply.text).toContain("UNAVAILABLE");
+    expect(reply.text).toContain("Nothing has been started");
+  });
+
+  it("starts the run when confirmed, and names it", async () => {
+    const recheckSeries = vi
+      .fn()
+      .mockResolvedValue(report({ dryRun: false, runId: "run-1", created: true }));
+    const reply = await invoke("recheck", fakeApi({ recheckSeries }), {
+      series: MD_MANGA,
+      extension: "mangaplus",
+      confirm: true,
+    });
+
+    expect(recheckSeries).toHaveBeenCalledWith("discord:ardax", {
+      mdMangaId: MD_MANGA,
+      extension: "mangaplus",
+      apply: true,
+      idempotencyKey: "discord:interaction-1",
+    });
+    expect(reply.text).toContain("run-1");
+    expect(reply.text).toContain("/runs show id:run-1");
+  });
+
+  it("warns when the extension publishes no catalogue listing to compare against", async () => {
+    const recheckSeries = vi.fn().mockResolvedValue(report({ publishesCatalogue: false }));
+    const reply = await invoke("recheck", fakeApi({ recheckSeries }), { series: MD_MANGA });
+    expect(reply.text).toContain("full catalogue listing");
+    expect(reply.text).toContain("probably find nothing");
+  });
+
+  it("says how to name a series rather than 404ing on typed text", async () => {
+    const recheckSeries = vi.fn();
+    const reply = await invoke("recheck", fakeApi({ recheckSeries }), { series: "sakamoto days" });
+    expect(recheckSeries).not.toHaveBeenCalled();
+    expect(reply.text).toContain("not a MangaDex title id");
+  });
+
+  it("is gated as a mutation; it queues real changes to public pages", () => {
+    expect(resolveSensitivity(COMMANDS_BY_NAME.get("recheck")!, null)).toBe("mutate");
+  });
+});

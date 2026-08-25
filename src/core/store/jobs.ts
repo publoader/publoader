@@ -43,6 +43,14 @@ export interface CreateRunInput {
   requireAllSegments?: boolean;
   /** Empty/omitted = single whole-extension job. */
   segments?: JobSegment[];
+  /**
+   * MangaDex title ids this run is deliberately limited to. Empty = the whole
+   * catalogue. Recorded on the run because the processor cannot infer it: a
+   * scoped run and an unscoped one that happened to find one title's chapters
+   * produce the same envelopes, and only one of them licenses the
+   * catalogue-wide removal passes.
+   */
+  scopeMangaIds?: string[];
 }
 
 export interface ClaimedJob {
@@ -106,6 +114,7 @@ export class JobStore {
             kind: input.kind,
             segmentsTotal: segments.length,
             requireAllSegments: input.requireAllSegments ?? true,
+            scopeMangaIds: input.scopeMangaIds ?? [],
             triggeredBy: input.triggeredBy ?? null,
             scheduledFor: input.scheduledFor ?? null,
             state: "PENDING",

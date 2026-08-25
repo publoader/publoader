@@ -193,12 +193,31 @@ export class SchedulerService {
       kind: "UPDATE" | "CLEAN" | "FORCE";
       triggeredBy: string;
       scheduledFor?: Date;
+      /**
+       * Limit the run to these titles: external manga ids for the worker to
+       * fetch, and the MangaDex ids they map to for the processor to trust the
+       * snapshot about. Both, because the two halves of the system address a
+       * series by different names and neither can derive the other's.
+       */
+      scope?: { mangaIds: string[]; mdMangaIds: string[] };
     },
   ): Promise<{ runId: string; created: boolean; segments: number }> {
     let segments: ReturnType<typeof computeSegments> = [];
-    // CLEAN runs are all-or-nothing over the full catalogue; never partition
-    // them; a missing segment must not read as "chapters were removed".
-    if (manifest.partition && opts.kind !== "CLEAN") {
+    // A scoped run is one job over a named subset, never partitioned: the
+    // subset is already small, and its whole purpose is that the processor can
+    // tell "these titles and no others" from "the whole catalogue".
+    if (opts.scope) {
+      segments = [
+        {
+          index: 0,
+          total: 1,
+          key: `scope:${opts.scope.mangaIds.length}`,
+          mangaIds: [...opts.scope.mangaIds],
+        },
+      ];
+    } else if (manifest.partition && opts.kind !== "CLEAN") {
+      // CLEAN runs are all-or-nothing over the full catalogue; never partition
+      // them; a missing segment must not read as "chapters were removed".
       // The DB (TrackedManga) is the source of truth for the tracked catalogue;
  // bundle data files only seed it at publish time.
       const tracked = await this.prisma.trackedManga.findMany({
@@ -242,6 +261,7 @@ export class SchedulerService {
       maxAttempts: manifest.max_attempts,
       minTrust: manifest.min_trust,
       segments,
+      scopeMangaIds: opts.scope?.mdMangaIds ?? [],
     });
     if (created) {
       metrics.jobsCreated.inc(
@@ -256,11 +276,16 @@ export class SchedulerService {
         extension: manifest.name,
         kind: opts.kind,
         idempotencyKey: opts.idempotencyKey,
+        ...(opts.scope ? { scope: opts.scope } : {}),
       });
       // Each extension is announced as it begins. Only on
       // `created`: createRun is idempotent by key, and a duplicate trigger must
       // not produce a second "started" that implies a second run.
-      await this.reportRunStarted(manifest.name);
+      //
+      // A scoped run is not announced at all: "Reading data from mangaplus"
+      // describes the extension's sweep of its catalogue, and an operator
+      // checking one series has not started one.
+      if (!opts.scope) await this.reportRunStarted(manifest.name);
     }
     return { runId: run.id, created, segments: Math.max(1, segments.length) };
   }

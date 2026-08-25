@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import AdmZip from "adm-zip";
 import type { FastifyInstance } from "fastify";
 import { loadConfig } from "../../src/config.js";
 import { createLogger } from "../../src/logging.js";
@@ -1250,6 +1251,199 @@ describe.skipIf(!dbReady())("chapter management endpoints", () => {
         where: { mdChapterId: uuid(1) },
       });
       expect(archived.chapterNumber).toBe("1");
+    });
+  });
+
+  // ---- asking the publisher whether a series is still there ----
+
+  /**
+   * The question that comes before a card: re-carding re-renders the page of a
+   * chapter already known to be gone, this finds out whether it is gone.
+   *
+   * It cannot answer synchronously — reading the publisher happens on a worker —
+   * so what this endpoint owes is a correctly shaped run: scoped to one series,
+   * CLEAN so the extension is asked for a full listing, and carrying the
+   * external id the extension knows the series by. The scope is the load-bearing
+   * part; test/integration/scopedRun.test.ts covers what the processor then does
+   * with it.
+   */
+  describe("re-checking one series at the publisher", () => {
+    const GROUP = "22222222-2222-4222-8222-222222222222";
+    const MD_MANGA = uuid(900);
+
+    /** A published bundle, so the run has a manifest and a group to work from. */
+    async function publish(name: string, over: Record<string, unknown> = {}) {
+      const manifest = {
+        name,
+        version: "1.0.0",
+        publoader_api: "^2.0.0",
+        entrypoint: "index.mjs",
+        mangadex_group_id: GROUP,
+        languages: ["en"],
+        allowed_hosts: ["example.com"],
+        ...over,
+      };
+      const zip = new AdmZip();
+      zip.addFile("manifest.json", Buffer.from(JSON.stringify(manifest), "utf8"));
+      zip.addFile("index.mjs", Buffer.from("export default () => ({});\n", "utf8"));
+      return ctx.bundles.publish({ zipData: zip.toBuffer(), manifest });
+    }
+
+    const recheck = (mdMangaId: string, payload: Record<string, unknown> = {}) =>
+      app.inject({
+        method: "POST",
+        url: `/api/v1/admin/chapters/series/${mdMangaId}/recheck`,
+        headers: root,
+        payload,
+      });
+
+    it("refuses a title no extension tracks; there is nobody to ask", async () => {
+      const res = await recheck(MD_MANGA);
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toContain("no extension tracks");
+    });
+
+    it("refuses to pick between two extensions that both publish the title", async () => {
+      await publish("exampleext");
+      await publish("otherext");
+      await prisma.trackedManga.createMany({
+        data: [
+          { extension: "exampleext", mangaId: "a1", mdMangaId: MD_MANGA },
+          { extension: "otherext", mangaId: "b1", mdMangaId: MD_MANGA },
+        ],
+      });
+
+      const res = await recheck(MD_MANGA);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().extensions.sort()).toEqual(["exampleext", "otherext"]);
+
+      // Named, it proceeds: each extension holds its own answer.
+      const named = await recheck(MD_MANGA, { extension: "otherext" });
+      expect(named.statusCode).toBe(200);
+      expect(named.json().extension).toBe("otherext");
+    });
+
+    /**
+     * An external id travels to the worker as a bare string, so for an
+     * extension with several catalogues it cannot say which one. The scheduler
+     * already declines to partition around that; refusing here is the same
+     * limit, said before a run scrapes the wrong series.
+     */
+    it("refuses a title whose external id lives in a named catalogue", async () => {
+      await publish("exampleext");
+      await prisma.trackedManga.create({
+        data: { extension: "exampleext", namespace: "shonenjump", mangaId: "709", mdMangaId: MD_MANGA },
+      });
+
+      const res = await recheck(MD_MANGA);
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toContain("named catalogues");
+      expect(await prisma.run.count()).toBe(0);
+    });
+
+    it("previews by default and starts nothing", async () => {
+      await publish("exampleext");
+      await prisma.trackedManga.create({
+        data: { extension: "exampleext", mangaId: "a1", mdMangaId: MD_MANGA },
+      });
+
+      const res = await recheck(MD_MANGA);
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({
+        dryRun: true,
+        action: "RECHECK",
+        extension: "exampleext",
+        mangaId: "a1",
+        removalMode: "unavailable",
+      });
+      expect(await prisma.run.count()).toBe(0);
+
+      const unconfirmed = await recheck(MD_MANGA, { dryRun: false });
+      expect(unconfirmed.statusCode).toBe(400);
+      expect(await prisma.run.count()).toBe(0);
+    });
+
+    /**
+     * The shape of the run is the whole deliverable: CLEAN so the extension is
+     * asked for a full listing, one job carrying the publisher's own id, and
+     * the scope recorded so the processor knows the snapshot speaks for this
+     * title and no other.
+     */
+    it("starts one scoped CLEAN job carrying the publisher's id for the series", async () => {
+      await publish("exampleext");
+      await prisma.trackedManga.create({
+        data: { extension: "exampleext", mangaId: "a1", mdMangaId: MD_MANGA },
+      });
+
+      const res = await recheck(MD_MANGA, { dryRun: false, confirm: true });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().ok).toBe(true);
+
+      const run = await prisma.run.findUniqueOrThrow({ where: { id: res.json().runId } });
+      expect(run.kind).toBe("CLEAN");
+      expect(run.extension).toBe("exampleext");
+      expect(run.segmentsTotal).toBe(1);
+      expect(run.scopeMangaIds).toEqual([MD_MANGA]);
+
+      const jobs = await prisma.job.findMany({ where: { runId: run.id } });
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]!.segmentMangaIds).toEqual(["a1"]);
+      expect(jobs[0]!.kind).toBe("CLEAN");
+
+      const audited = await prisma.auditEvent.findFirst({
+        where: { action: "chapter.series.recheck" },
+      });
+      expect(audited?.subject).toBe(MD_MANGA);
+    });
+
+    it("honours the manifest's removal mode over the platform default", async () => {
+      await publish("exampleext", { chapter_removal_mode: "delete" });
+      await prisma.trackedManga.create({
+        data: { extension: "exampleext", mangaId: "a1", mdMangaId: MD_MANGA },
+      });
+      expect((await recheck(MD_MANGA)).json().removalMode).toBe("delete");
+    });
+
+    it("refuses while the platform is paused", async () => {
+      await publish("exampleext");
+      await prisma.trackedManga.create({
+        data: { extension: "exampleext", mangaId: "a1", mdMangaId: MD_MANGA },
+      });
+      await ctx.settings.setPauseUntil(Infinity);
+
+      const res = await recheck(MD_MANGA, { dryRun: false, confirm: true });
+      expect(res.statusCode).toBe(409);
+      expect(await prisma.run.count()).toBe(0);
+    });
+
+    /**
+     * Gated as a run, not as a chapter write: it starts the same machinery
+     * `POST /runs` does, narrowed to one title, so gating it harder than the
+     * whole-catalogue version it is a subset of would be theatre.
+     */
+    it("needs runs:write, and takes it from an api token", async () => {
+      await publish("exampleext");
+      await prisma.trackedManga.create({
+        data: { extension: "exampleext", mangaId: "a1", mdMangaId: MD_MANGA },
+      });
+
+      const reader = await mint(["chapters:read"]);
+      const refused = await app.inject({
+        method: "POST",
+        url: `/api/v1/admin/chapters/series/${MD_MANGA}/recheck`,
+        headers: reader,
+        payload: {},
+      });
+      expect(refused.statusCode).toBe(403);
+
+      const runner = await mint(["runs:write"]);
+      const allowed = await app.inject({
+        method: "POST",
+        url: `/api/v1/admin/chapters/series/${MD_MANGA}/recheck`,
+        headers: runner,
+        payload: { dryRun: false, confirm: true },
+      });
+      expect(allowed.statusCode).toBe(201);
     });
   });
 });

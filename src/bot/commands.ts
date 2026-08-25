@@ -143,6 +143,27 @@ function requireExtensionName(raw: string | null): string {
   return name;
 }
 
+/**
+ * A MangaDex title id, as the `series` autocomplete supplies.
+ *
+ * The autocomplete offers titles by name and sends back the id, so a value that
+ * is not one means the option was typed past the suggestions. Saying so beats a
+ * 404 on a uuid route: the fix is to pick from the list, and nothing about
+ * "not found" suggests that.
+ */
+function requireSeriesId(raw: string | null): string {
+  const value = (raw ?? "").trim();
+  if (!MD_UUID_RE.test(value)) {
+    throw new UserError(
+      `\`${value || "(empty)"}\` is not a MangaDex title id. Start typing the series name and ` +
+        "pick it from the suggestions, or paste the id out of the title's URL.",
+    );
+  }
+  return value;
+}
+
+const MD_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function requireString(options: OptionReader, name: string): string {
   const value = (options.string(name) ?? "").trim();
   if (!value) throw new UserError(`\`${name}\` is required.`);
@@ -1457,6 +1478,74 @@ const commands: BotCommand[] = [
           "Nothing has been queued: the bot's token cannot post card images. Do it from " +
           "**System → Unavailable cards** on the dashboard, or run\n" +
           `\`\`\`\npadmin chapters recard --series ${exact.mdMangaId}${narrow} --apply\n\`\`\``,
+      };
+    },
+  },
+  {
+    name: "recheck",
+    description: "Ask the publisher whether one series' chapters are still there.",
+    // Mutate, not read: what comes back from the publisher is turned into real
+    // UNAVAILABLE (or DELETE) tasks against live MangaDex pages. It is the same
+    // machinery /run drives, narrowed to one title, and it is gated the same
+    // way — including the explicit confirm a CLEAN needs there.
+    sensitivity: "mutate",
+    ephemeral: true,
+    builder: new SlashCommandBuilder()
+      .setName("recheck")
+      .setDescription("Ask the publisher whether one series' chapters are still there.")
+      .addStringOption((o) =>
+        o
+          .setName("series")
+          .setDescription("The series, by name or MangaDex id.")
+          .setRequired(true)
+          .setAutocomplete(true),
+      )
+      .addStringOption((o) =>
+        o
+          .setName("extension")
+          .setDescription("Which extension to ask, when more than one tracks the title.")
+          .setAutocomplete(true),
+      )
+      .addBooleanOption((o) =>
+        o.setName("confirm").setDescription("Start the run. Without it this only reports what it would cover."),
+      ),
+    async run(ctx) {
+      const series = requireSeriesId(ctx.options.string("series"));
+      const extension = ctx.options.string("extension");
+      const apply = ctx.options.boolean("confirm") === true;
+      const result = await ctx.api.recheckSeries(ctx.actor, {
+        mdMangaId: series,
+        extension: extension ?? undefined,
+        apply,
+        // One key per interaction, for the same reason /run has one: a Discord
+        // retry must collapse into the same run rather than scrape twice.
+        idempotencyKey: `discord:${ctx.interactionId}`,
+      });
+
+      const holdings =
+        result.onMangadex === null
+          ? "MangaDex holdings unknown (the API holds no MangaDex credentials)"
+          : `**${result.onMangadex}** chapter(s) on MangaDex, ${result.carded ?? 0} already carded, ` +
+            `**${result.candidates ?? 0}** that this could mark`;
+      const caveat = result.publishesCatalogue
+        ? ""
+        : `\n:warning: \`${result.extension}\` has not sent a full catalogue listing recently. ` +
+          "Removal detection is computed from one, so this will probably find nothing.";
+
+      if (!apply) {
+        return {
+          text:
+            `:mag: Re-checking this series would ask \`${result.extension}\` (as \`${result.mangaId}\`) ` +
+            `for its current listing.\n${holdings}; anything it no longer lists is queued as ` +
+            `**${result.removalMode === "delete" ? "DELETE" : "UNAVAILABLE"}**.${caveat}\n` +
+            "Nothing has been started. Re-issue with `confirm: true` to start the run.",
+        };
+      }
+      return {
+        text: result.created
+          ? `:satellite: Re-check started for this series via \`${result.extension}\`: run \`${result.runId}\`.\n` +
+            `${holdings}.${caveat}\nFollow it with \`/runs show id:${result.runId}\`, then \`/queue list kind:UNAVAILABLE\`.`
+          : `:information_source: A run for that exact request already existed: \`${result.runId}\` (nothing new was created).`,
       };
     },
   },

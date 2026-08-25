@@ -136,6 +136,16 @@ model Run {
   state              RunState  @default(PENDING)
   segmentsTotal      Int       @default(1) @map("segments_total")
   requireAllSegments Boolean   @default(true) @map("require_all_segments")
+  /// MangaDex title ids this run deliberately looked at, and nothing else.
+  ///
+  /// Empty is the normal case: the run covered the whole catalogue, so its
+  /// `allChapters` snapshot means "this is everything the publisher has" and
+  /// the catalogue-wide removal passes are safe to run against it. Non-empty
+  /// means the snapshot is authoritative for exactly these titles and SILENT
+  /// about every other one, which is a different claim entirely: a tracked
+  /// title missing from a scoped snapshot was never asked about, and reading
+  /// that as "the publisher dropped it" would unpublish the catalogue.
+  scopeMangaIds      String[]  @default([]) @map("scope_manga_ids")
   triggeredBy        String?   @map("triggered_by")
   scheduledFor       DateTime? @map("scheduled_for")
   startedAt          DateTime? @map("started_at")

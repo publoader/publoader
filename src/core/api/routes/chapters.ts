@@ -11,6 +11,7 @@ import { ChapterReconciler } from "../../md/chapterReconcile.js";
 import { generateChapterCard } from "../../md/card.js";
 import { unavailableCardOptions } from "../../md/unavailableCard.js";
 import type { MdChapterDetail } from "../../md/client.js";
+import { isCarded } from "../../md/types.js";
 import {
   ARCHIVES,
   CHAPTER_ARCHIVES,
@@ -1761,6 +1762,188 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
           sidecars: {},
           auditAction: "chapter.delete",
           auditDetail: { reason: body.reason ?? null, bulkKind: "delete" },
+        });
+      },
+    );
+
+    /**
+     * Ask the publisher whether one series' chapters are still there.
+     *
+     * The re-card route above re-renders a card for a chapter already known to
+     * be gone. This is the question before that one: *is* it gone? Answering it
+     * means reading the publisher, which happens on a worker running the
+     * extension, so this does not answer — it starts a run that will.
+     *
+     * The run is scoped: one CLEAN job whose `segmentMangaIds` is this series'
+     * external id. CLEAN because that is the contract's way of asking for a
+     * full catalogue listing (`allChapters`), which is the only thing removal
+     * detection can be computed from — an extension that reports only its
+     * updates can never say that something is missing. Scoped because the
+     * processor must not read the resulting snapshot as a statement about the
+     * whole catalogue; `runs.scope_manga_ids` is what tells it so, and without
+     * that flag this endpoint would unpublish every title the run never asked
+     * about.
+     *
+     * From there nothing here is new: the processor diffs the publisher's
+     * listing against what MangaDex holds under our group and queues the
+     * difference, as `UNAVAILABLE` or `DELETE` per the removal mode — the same
+     * pass, and the same guards, that a scheduled run uses.
+     */
+    scope.post(
+      "/api/v1/admin/chapters/series/:mdMangaId/recheck",
+      { preHandler: requireScope("runs:write") },
+      async (req, reply) => {
+        const { mdMangaId } = parseOrThrow(z.object({ mdMangaId: z.string().uuid() }), req.params);
+        const body = parseOrThrow(
+          z
+            .object({
+              extension: z.string().max(64).optional(),
+              dryRun: z.boolean().default(true),
+              confirm: z.boolean().default(false),
+              idempotencyKey: z.string().max(256).optional(),
+            })
+            .strict(),
+          req.body ?? {},
+        );
+
+        // The tracked map is the only thing that knows a MangaDex title by the
+        // publisher's name for it, which is the name the extension answers to.
+        const tracked = await ctx.prisma.trackedManga.findMany({
+          where: { mdMangaId, ...(body.extension ? { extension: body.extension } : {}) },
+          select: { extension: true, namespace: true, mangaId: true },
+        });
+        if (tracked.length === 0) {
+          return reply.code(404).send({
+            error: body.extension
+              ? `${body.extension} does not track that MangaDex title`
+              : "no extension tracks that MangaDex title, so nothing can be asked about it",
+            mdMangaId,
+          });
+        }
+        // Two extensions publishing the same title is legitimate, and each
+        // holds its own answer; picking one for the operator would re-check a
+        // publisher they did not mean.
+        const extensions = [...new Set(tracked.map((row) => row.extension))];
+        if (extensions.length > 1) {
+          return reply.code(409).send({
+            error: "more than one extension tracks that title; name the one to ask",
+            extensions,
+          });
+        }
+        const entry = tracked[0]!;
+        // The same limit the scheduler refuses to partition around: an external
+        // id travels to the worker as a bare string, so for an extension with
+        // several catalogues it cannot say which one, and the worker would
+        // either fetch the wrong series or filter this one out entirely.
+        if (entry.namespace !== "") {
+          return reply.code(409).send({
+            error:
+              `${entry.extension} keeps its tracked ids in named catalogues (this one is in ` +
+              `"${entry.namespace}"), and a run's manga subset travels as a bare id that cannot ` +
+              "name one. Re-check the whole extension instead.",
+            extension: entry.extension,
+            namespace: entry.namespace,
+          });
+        }
+
+        const bundle = await ctx.bundles.latest(entry.extension);
+        if (!bundle) {
+          return reply.code(404).send({ error: `no bundle published for ${entry.extension}` });
+        }
+        const manifest = Manifest.parse(bundle.manifest);
+        const groupId = manifest.mangadex_group_id;
+        const removalMode = manifest.chapter_removal_mode ?? (await ctx.settings.getRemovalMode());
+
+        // What is on MangaDex right now under our group: the set the run's
+        // answer will be diffed against, and the ceiling on what it can touch.
+        // An API instance with no MangaDex credentials cannot count it, which
+        // is a thinner preview and not a reason to refuse the run.
+        const onMangadex = ctx.md ? await ctx.md.chaptersForManga(mdMangaId, groupId) : null;
+        const carded = onMangadex?.filter((chapter) => isCarded(chapter)).length ?? null;
+
+        // Removal detection needs a full catalogue listing, and not every
+        // extension publishes one. Whether this one does is not in the
+        // manifest, so the honest signal is whether its recent runs carried a
+        // snapshot: a "no" here means the re-check will run and find nothing,
+        // which is worth knowing before rather than after.
+        const recent = await ctx.prisma.run.findMany({
+          where: { extension: entry.extension, state: "PROCESSED" },
+          orderBy: { createdAt: "desc" },
+          take: 5,
+          select: { id: true },
+        });
+        const totals = await ctx.runChapters.totalsForRuns(recent.map((run) => run.id));
+        const snapshots = [...totals.values()].filter((total) => total.all !== null).length;
+
+        const preview = {
+          mdMangaId,
+          extension: entry.extension,
+          mangaId: entry.mangaId,
+          removalMode,
+          onMangadex: onMangadex?.length ?? null,
+          // Already carrying our card: the removal pass leaves these alone, so
+          // they are not candidates however the publisher answers.
+          carded,
+          candidates: onMangadex === null || carded === null ? null : onMangadex.length - carded,
+          publishesCatalogue: snapshots > 0,
+          note:
+            snapshots > 0
+              ? `${entry.extension} will be asked for its full listing of this series; chapters on ` +
+                `MangaDex that it no longer lists are queued as ${removalMode === "delete" ? "DELETE" : "UNAVAILABLE"}.`
+              : `none of ${entry.extension}'s last ${recent.length} processed run(s) carried a full ` +
+                "catalogue listing. Removal detection is computed from one, so this re-check will " +
+                "probably find nothing to mark. Nothing is harmed by running it.",
+        };
+
+        if (body.dryRun) {
+          return reply.send({
+            dryRun: true,
+            action: "RECHECK",
+            ...preview,
+            note:
+              `${preview.note} Nothing has been queued. Repeat with {dryRun: false, confirm: true} ` +
+              "to start the run.",
+          });
+        }
+        if (!body.confirm) {
+          return reply
+            .code(400)
+            .send({ error: "a live re-check needs confirm: true alongside dryRun: false" });
+        }
+        if (await ctx.settings.isPaused()) {
+          return reply.code(409).send({ error: "platform is paused" });
+        }
+
+        const who = actor(req);
+        const result = await ctx.scheduler.createRunForExtension(manifest, bundle, {
+          idempotencyKey:
+            body.idempotencyKey ?? `recheck:${entry.extension}:${mdMangaId}:${new Date().toISOString()}`,
+          // CLEAN is how the contract asks for `allChapters`; scoping is what
+          // keeps that from meaning "the whole catalogue is this one series".
+          kind: "CLEAN",
+          triggeredBy: who,
+          scope: { mangaIds: [entry.mangaId], mdMangaIds: [mdMangaId] },
+        });
+
+        await ctx.audit.record(who, "chapter.series.recheck", mdMangaId, {
+          runId: result.runId,
+          extension: entry.extension,
+          mangaId: entry.mangaId,
+          removalMode,
+          onMangadex: preview.onMangadex,
+          candidates: preview.candidates,
+        });
+
+        return reply.code(result.created ? 201 : 200).send({
+          ok: true,
+          dryRun: false,
+          action: "RECHECK",
+          ...preview,
+          runId: result.runId,
+          created: result.created,
+          note:
+            "the run is queued; a worker executes it and the processor queues whatever the " +
+            "publisher no longer lists. Watch it under Runs, then under Queues.",
         });
       },
     );

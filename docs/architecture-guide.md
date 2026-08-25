@@ -472,6 +472,17 @@ processing is idempotent (`core/processor/processor.ts:116-132`).
    `INGESTING` (`core/processor/processor.ts:144-146`). A clean run decides deletions from a "the
    publisher no longer has this" premise; acting on a partial view would remove
    chapters a missing segment would have vouched for.
+
+   A **scoped** run (`runs.scope_manga_ids` non-empty, created by the one-series
+   re-check) is the deliberate version of a partial view, and is handled by
+   narrowing the premise rather than by refusing: its snapshot is authoritative
+   for the titles it names and silent about every other one. The processor
+   therefore visits the scope even where it reported no updates — the point of a
+   re-check is a series that has published nothing for months — and skips both
+   catalogue-wide passes below, which read a tracked title's absence from the
+   snapshot as "the publisher dropped it". Running them against a scoped
+   snapshot would unpublish the entire rest of the catalogue; that is the case
+   `test/integration/scopedRun.test.ts` pins, control included.
 3. **Replaces the worker-reported configuration with the database's.** Override
    options come from `extension_configs`, and the tracked set is the *union* of
    what the database knows with what the worker reported
