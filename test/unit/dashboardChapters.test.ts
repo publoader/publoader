@@ -304,15 +304,87 @@ function apiRoutes(): { match: RegExp; body: unknown | ((init?: { body?: string 
       },
     },
     {
-      // Shaped like the live deployment's real answer: a catalogue far larger
-      // than our record of it, and a chapter-id rule the extension's own rows
-      // demonstrate. `unavailableRecorded`/`untrackedFound` are what the two
-      // buttons put in front of an operator before writing anything.
+      /**
+       * Reconcile is two endpoints, and the split is the thing under test: the
+       * POST only *starts* a pass (a group walk is ~124 MangaDex requests at
+       * the client's rate limit, minutes, far longer than a request survives
+       * the proxy), and the GET is polled until it finishes.
+       *
+       * The stub answers POST with a running state and GET with the finished
+       * report, so a card that still expected the old synchronous report --
+       * reading `untrackedFound` straight off the POST -- renders nothing.
+       */
       match: /\/chapters\/reconcile$/,
-      body: {
-        ok: true,
-        dryRun: true,
-        groups: [
+      body: (init?: { method?: string; body?: string }) =>
+        (init?.method ?? "GET") === "POST"
+          ? {
+              ok: true,
+              started: true,
+              state: "running",
+              startedAt: "2026-08-25T00:00:00Z",
+              beatAt: "2026-08-25T00:00:00Z",
+              actor: "ardax",
+              options: JSON.parse(init?.body ?? "{}"),
+              progress: {
+                phase: "starting",
+                extension: null,
+                done: 0,
+                total: null,
+                detail: "starting",
+              },
+            }
+          : reconcileStatus(),
+    },
+  ];
+}
+
+/**
+ * Whether a pass is in flight, as far as the poll endpoint is concerned.
+ *
+ * A flag rather than a countdown, because that is what the real thing is: a
+ * pass is running for minutes and every poll during it says so. A countdown
+ * would also be unstable here -- the view remounts several times as its
+ * resources arrive, each mount polls, and "the first N polls" would land on
+ * whichever mount happened to get there first.
+ *
+ * Left false, the pass appears already finished, so tests that only care about
+ * which request a button makes need not wait out a poll interval.
+ */
+let reconcileRunning = false;
+
+function reconcileStatus(): unknown {
+  if (reconcileRunning) {
+    return {
+      ok: true,
+      state: "running",
+      startedAt: "2026-08-25T00:00:00Z",
+      beatAt: "2026-08-25T00:00:00Z",
+      actor: "ardax",
+      options: {},
+      progress: {
+        phase: "walking",
+        extension: "mangaplus",
+        done: 2400,
+        total: null,
+        detail: "reading mangaplus's chapters on MangaDex: 2400 so far",
+      },
+    };
+  }
+  return { ok: true, state: "done", ...RECONCILE_DONE };
+}
+
+/**
+ * Shaped like the live deployment's real answer: a catalogue far larger than
+ * our record of it, and a chapter-id rule the extension's own rows demonstrate.
+ */
+const RECONCILE_DONE = {
+  startedAt: "2026-08-25T00:00:00Z",
+  finishedAt: "2026-08-25T00:04:00Z",
+  actor: "ardax",
+  options: {},
+  report: {
+    dryRun: true,
+    groups: [
           {
             extension: "mangaplus",
             groupId: "4f1de6a2-0000-4000-8000-000000000000",
@@ -334,13 +406,11 @@ function apiRoutes(): { match: RegExp; body: unknown | ((init?: { body?: string 
         idsRecorded: 5593,
         scanned: 491,
         skippedByGroupWalk: 491,
-        deletedFound: 0,
-        deletedRecorded: 0,
-        hiddenOnMangadex: [],
-      },
-    },
-  ];
-}
+    deletedFound: 0,
+    deletedRecorded: 0,
+    hiddenOnMangadex: [],
+  },
+};
 
 /** Every path the stub was asked for, so a test can assert what a view fetched. */
 let requested: string[] = [];
@@ -381,6 +451,7 @@ async function goto(hash: string): Promise<void> {
 describe("dashboard chapter views", () => {
   beforeEach(async () => {
     requested = [];
+    reconcileRunning = false;
     const html = readFileSync(INDEX_HTML, "utf8");
     // Body only: the <head> would pull app.js and style.css over the network,
     // and the script is evaluated by hand below. The markup is this repo's own
@@ -525,9 +596,16 @@ describe("dashboard chapter views", () => {
     const reconcileCalls = () =>
       win.fetch.mock.calls.filter(([url]: [string]) => String(url).includes("/chapters/reconcile"));
 
+    /** The POSTs that start a real pass, as opposed to the polls that watch one. */
     const writes = () =>
       reconcileCalls().filter(
-        ([, init]: [string, { body: string }]) => JSON.parse(init.body).dryRun === false,
+        ([, init]: [string, { method?: string; body?: string }]) =>
+          init.method === "POST" && JSON.parse(init.body ?? "{}").dryRun === false,
+      );
+
+    const polls = () =>
+      reconcileCalls().filter(
+        ([, init]: [string, { method?: string }]) => (init.method ?? "GET") === "GET",
       );
 
     it("offers Track them on the uploaded archive, and reports the size of the gap", async () => {
@@ -535,20 +613,25 @@ describe("dashboard chapter views", () => {
       expect(text()).toContain("Reconcile with MangaDex");
 
       click("Check");
-      await settle();
+      await settle(20);
 
       const view = text();
       // The number an operator is deciding on, and the reason it matters.
       expect(view).toContain("5593");
       expect(view).toContain("postedChapterIds");
-      expect(JSON.parse(reconcileCalls()[0][1].body)).toEqual({ dryRun: true });
+      const posts = reconcileCalls().filter(
+        ([, init]: [string, { method?: string }]) => init.method === "POST",
+      );
+      expect(JSON.parse(posts[0][1].body)).toEqual({ dryRun: true });
+      // The report came from the poll, not the POST: the POST only starts it.
+      expect(polls().length).toBeGreaterThan(0);
     });
 
     it("tracks the untracked chapters without touching the other two tables", async () => {
       await goto("#/chapters");
-      click("Check");
-      await settle();
 
+      // No Check first. That is the point: Check is itself a four-minute pass,
+      // so requiring it meant walking MangaDex twice to do one thing.
       click("Track them");
       await settle();
       // The confirm dialog stands between the click and any write.
@@ -559,25 +642,50 @@ describe("dashboard chapter views", () => {
       // skipUnavailable and skipDeleted are the whole point: the button says it
       // tracks chapters, so it must not also archive carded ones, and the
       // deletion sweep is one MangaDex call per row it cannot rule out.
-      expect(JSON.parse(writes()[0][1].body)).toEqual({
+      expect(JSON.parse(writes()[0][1].body ?? "{}")).toEqual({
         dryRun: false,
         skipDeleted: true,
         skipUnavailable: true,
       });
+      // And it followed the pass rather than expecting the POST to carry the
+      // answer, so the counts are on screen when it ends.
+      expect(text()).toContain("5593");
     });
 
-    it("refuses to write before the operator has seen a count", async () => {
+    it("writes nothing if the confirm dialog is dismissed", async () => {
       await goto("#/chapters");
       click("Track them");
+      await settle();
+      click("Cancel");
       await settle();
 
       expect(writes()).toHaveLength(0);
     });
 
+    it("picks up a running pass on mount and says what it is doing", async () => {
+      // Two failures in one. Navigating away and back used to show an idle card
+      // over four minutes of running MangaDex calls, and the obvious next move
+      // was to start a second pass. And the original failure -- a four-minute
+      // request dying to the proxy -- could only ever be reported as a bare
+      // error, indistinguishable from the platform being broken.
+      reconcileRunning = true;
+      await goto("#/chapters");
+      await settle();
+
+      expect(polls().length).toBeGreaterThan(0);
+      expect(text()).toContain("reading mangaplus's chapters on MangaDex");
+      expect(text()).toContain("keeps going if you leave the page");
+      // No invented total: MangaDex reports none up front, so the card must not
+      // either. "2400 of ..." would be the only dishonest number on the page.
+      expect(text()).not.toContain("2400 of");
+      // And nothing was started: the card joined the pass rather than adding one.
+      expect(writes()).toHaveLength(0);
+    }, 10_000);
+
     it("archives from the unavailable view without adopting into uploaded", async () => {
       await goto("#/chapters/unavailable");
       click("Check");
-      await settle();
+      await settle(20);
 
       click("Record them");
       await settle();
@@ -587,7 +695,7 @@ describe("dashboard chapter views", () => {
       expect(writes()).toHaveLength(1);
       // skipAdopt: the operator is looking at the unavailable archive, and
       // 5593 new rows in a third table is not what "Record them" promises.
-      expect(JSON.parse(writes()[0][1].body)).toEqual({ dryRun: false, skipAdopt: true });
+      expect(JSON.parse(writes()[0][1].body ?? "{}")).toEqual({ dryRun: false, skipAdopt: true });
     });
 
     it("does not offer either write button on the edited archive, which it cannot rebuild", async () => {

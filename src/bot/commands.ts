@@ -27,6 +27,8 @@ import {
   AdminApiError,
   describeApiError,
   type AdminApiClient,
+  type ChapterReconcileReport,
+  type ChapterReconcileStatus,
   type ErrorClearedFilter,
   type RemovalMode,
   type RunKind,
@@ -327,6 +329,42 @@ const RUN_KINDS: { name: string; value: RunKind }[] = [
   { name: "force (run now regardless of schedule)", value: "FORCE" },
   { name: "clean (destructive: full re-scrape)", value: "CLEAN" },
 ];
+
+/**
+ * How long `/reconcile` will wait for a pass before answering with progress.
+ *
+ * Discord gives a deferred interaction fifteen minutes, but nobody watches a
+ * chat window for that long, and a pass over several groups can exceed it
+ * anyway. Half a minute is enough that a small deployment answers with real
+ * numbers on the first try, and short enough that a large one does not look
+ * hung. Nothing is lost by giving up: the pass runs on the server and the next
+ * `/reconcile` finds it.
+ */
+const RECONCILE_WAIT_MS = 30_000;
+const RECONCILE_POLL_MS = 2_000;
+
+/**
+ * Wait for a reconcile pass, or return null when it is still going.
+ *
+ * Returns the report the moment one exists -- including a report from a pass
+ * that finished before this command ran, which is what makes "ask again in a
+ * minute" work.
+ */
+async function waitForReconcile(
+  ctx: { api: { reconcileStatus(actor: string): Promise<ChapterReconcileStatus> }; actor: string },
+  started: ChapterReconcileStatus,
+): Promise<ChapterReconcileReport | null> {
+  if (started.state === "done" && started.report) return started.report;
+
+  const deadline = Date.now() + RECONCILE_WAIT_MS;
+  for (;;) {
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, RECONCILE_POLL_MS));
+    const status = await ctx.api.reconcileStatus(ctx.actor);
+    if (status.state === "done" && status.report) return status.report;
+    if (status.state === "failed" || status.state === "idle") return null;
+  }
+}
 
 const commands: BotCommand[] = [
   {
@@ -1348,7 +1386,30 @@ const commands: BotCommand[] = [
       ),
     async run(ctx) {
       const extension = ctx.options.string("extension");
-      const report = await ctx.api.reconcileChapters(ctx.actor, extension ? [extension] : []);
+      const started = await ctx.api.startChapterReconcile(ctx.actor, extension ? [extension] : []);
+
+      // The pass takes minutes -- a group walk is ~124 MangaDex requests at the
+      // client's rate limit -- and a Discord interaction cannot be left that
+      // long. So this waits as long as it safely can and then reports where the
+      // pass got to; the pass itself carries on, and asking again picks it up.
+      const report = await waitForReconcile(ctx, started);
+      if (!report) {
+        const status = await ctx.api.reconcileStatus(ctx.actor);
+        if (status.state === "failed") {
+          return { text: `:x: The reconcile pass failed: \`${status.error ?? "no reason given"}\`` };
+        }
+        const progress = status.progress;
+        return {
+          text:
+            ":hourglass: Still reading MangaDex" +
+            (started.started ? "" : " (a pass was already running)") +
+            (progress
+              ? `: ${progress.detail}` +
+                (progress.total !== null ? ` (${progress.done}/${progress.total})` : "")
+              : ".") +
+            "\nIt keeps going without me. Run `/reconcile` again in a minute for the numbers.",
+        };
+      }
 
       const missing =
         report.unavailableRecorded + report.deletedRecorded + report.untrackedFound;

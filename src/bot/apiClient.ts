@@ -312,6 +312,14 @@ export interface ArchiveSeriesReport {
   capped: boolean;
 }
 
+/** Mirrors ReconcileRunState in core/md/reconcileRunner.ts. */
+export interface ChapterReconcileStatus {
+  state: "idle" | "running" | "done" | "failed";
+  progress?: { detail: string; done: number; total: number | null };
+  report?: ChapterReconcileReport;
+  error?: string;
+}
+
 export interface ChapterReconcileReport {
   dryRun: boolean;
   groups: {
@@ -547,21 +555,40 @@ export class AdminApiClient {
   }
 
   /**
-   * Ask what MangaDex has stopped serving or has deleted.
+   * Start a reporting pass over what MangaDex holds.
    *
    * Dry run only, and not because the bot is untrusted in general: applying is
    * closed to api tokens at the endpoint (routes/chapters.ts), so a bot token
    * could not write these rows even if this asked it to. Reporting is the
    * useful half here anyway: the answer is a number somebody needs to see
    * before deciding to act on it.
+   *
+   * The pass runs on the server and this only starts it. It takes minutes --
+   * a group walk is ~124 MangaDex requests at the client's rate limit -- which
+   * is longer than a Discord interaction may be left unanswered, so the command
+   * polls `reconcileStatus` and reports whatever is known when its own clock
+   * runs out.
    */
-  reconcileChapters(actor: string, extensions: string[]): Promise<ChapterReconcileReport> {
+  startChapterReconcile(
+    actor: string,
+    extensions: string[],
+  ): Promise<ChapterReconcileStatus & { started: boolean }> {
     return this.request({
       method: "POST",
       path: "/api/v1/admin/chapters/reconcile",
       scope: "chapters:read",
       actor,
       json: { dryRun: true, extensions },
+    });
+  }
+
+  /** Where the current or last pass is up to. Cheap: one settings row, no MangaDex. */
+  reconcileStatus(actor: string): Promise<ChapterReconcileStatus> {
+    return this.request({
+      method: "GET",
+      path: "/api/v1/admin/chapters/reconcile",
+      scope: "chapters:read",
+      actor,
     });
   }
 

@@ -128,6 +128,17 @@ export interface MdEntity {
  * drops, and once MangaDex stops serving a chapter this snapshot is the only
  * remaining answer to what it looked like.
  */
+/**
+ * Called after each page of a group walk, with the chapters collected so far.
+ *
+ * A group walk is the slowest thing this platform asks MangaDex for: two full
+ * paginations at `mdRatelimitMs` apart, which on the live group is ~124 requests
+ * and about four minutes. Anything driving it needs to be able to say what it is
+ * doing while it happens, and "collected so far" is the only honest measure --
+ * MangaDex reports no total up front.
+ */
+export type WalkProgress = (collected: number, pass: "all" | "served") => void;
+
 export interface MdGroupAvailability {
   /** Every chapter id the group has, including the unserved ones. */
   all: Map<string, MdEntity>;
@@ -167,7 +178,10 @@ export interface MdUploadedImage {
  */
 export interface MdExtendedApi extends MdApi {
   chapterById(chapterId: string, includes?: string[]): Promise<MdChapterDetail | null>;
-  chapterAvailabilityForGroup(groupId: string): Promise<MdGroupAvailability>;
+  chapterAvailabilityForGroup(
+    groupId: string,
+    onPage?: WalkProgress,
+  ): Promise<MdGroupAvailability>;
   beginEditSession(chapterId: string, version: number | null): Promise<{ id: string }>;
   uploadImages(
     sessionId: string,
@@ -589,6 +603,7 @@ export class MdClient implements MdExtendedApi {
   private async paginate(
     route: string,
     params: Record<string, string | string[] | number>,
+    onPage?: (collected: number) => void,
   ): Promise<MdEntity[]> {
     const collected: MdEntity[] = [];
     let offset = 0;
@@ -600,6 +615,7 @@ export class MdClient implements MdExtendedApi {
       });
       const entities = MdClient.entities(response.data);
       collected.push(...entities);
+      onPage?.(collected.length);
       if (entities.length === 0) break;
 
       offset += PAGE_LIMIT;
@@ -737,13 +753,20 @@ export class MdClient implements MdExtendedApi {
    * this compares. Both passes are otherwise identical so the difference
    * between them can only mean the one thing.
    */
-  async chapterAvailabilityForGroup(groupId: string): Promise<MdGroupAvailability> {
+  async chapterAvailabilityForGroup(
+    groupId: string,
+    onPage?: WalkProgress,
+  ): Promise<MdGroupAvailability> {
     const page = async (includeUnavailable: boolean): Promise<MdEntity[]> =>
-      this.paginate("chapter", {
-        "groups[]": [groupId],
-        "order[createdAt]": "asc",
-        ...(includeUnavailable ? INCLUDE_UNAVAILABLE : {}),
-      });
+      this.paginate(
+        "chapter",
+        {
+          "groups[]": [groupId],
+          "order[createdAt]": "asc",
+          ...(includeUnavailable ? INCLUDE_UNAVAILABLE : {}),
+        },
+        onPage ? (collected) => onPage(collected, includeUnavailable ? "all" : "served") : undefined,
+      );
 
     const all = new Map<string, MdEntity>();
     for (const entity of await page(true)) all.set(entity.id, entity);

@@ -7,7 +7,8 @@ import { sessionAuthenticator } from "../session.js";
 import { normaliseMangadexLanguage } from "../../../contracts/languages.js";
 import { Manifest, hostAllowed } from "../../../contracts/manifest.js";
 import { chapterToTaskPayload } from "../../md/chapterRows.js";
-import { ChapterReconciler } from "../../md/chapterReconcile.js";
+import { ReconcileRunner } from "../../md/reconcileRunner.js";
+import type { MdExtendedApi } from "../../md/client.js";
 import { generateChapterCard } from "../../md/card.js";
 import { unavailableCardOptions } from "../../md/unavailableCard.js";
 import type { MdChapterDetail } from "../../md/client.js";
@@ -168,6 +169,22 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
     });
 
     /** Same attribution rules as routes/admin.ts, ops.ts and queues.ts. */
+    /**
+     * The background reconcile runner.
+     *
+     * `md` is passed rather than read off `ctx` so the caller's own null check
+     * is what narrows it; there is exactly one deployment shape without a
+     * MangaDex client and both routes below answer for it explicitly.
+     */
+    const runner = (md: MdExtendedApi): ReconcileRunner =>
+      new ReconcileRunner({
+        prisma: ctx.prisma,
+        md,
+        log: ctx.log,
+        audit: ctx.audit,
+        settings: ctx.settings,
+      });
+
     const actor = (req: FastifyRequest): string => {
       const claimed = (req.headers["x-actor"] as string | undefined)?.slice(0, 64);
       const principal = req.principal;
@@ -559,21 +576,38 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
           }
         }
 
-        const reconciler = new ChapterReconciler({
-          prisma: ctx.prisma,
-          md: ctx.md,
-          log: ctx.log,
-          audit: ctx.audit,
-        });
-        const report = await reconciler.run({
-          dryRun: body.dryRun,
-          extensions: body.extensions,
-          skipDeleted: body.skipDeleted,
-          skipAdopt: body.skipAdopt,
-          skipUnavailable: body.skipUnavailable,
-          actor: actor(req),
-        });
-        return { ok: true, ...report };
+        const { started, status } = await runner(ctx.md).start(
+          {
+            dryRun: body.dryRun,
+            extensions: body.extensions,
+            skipDeleted: body.skipDeleted,
+            skipAdopt: body.skipAdopt,
+            skipUnavailable: body.skipUnavailable,
+          },
+          actor(req),
+        );
+        // 202, because the work has not happened yet. `started: false` is not
+        // an error: it means a pass was already in flight, which is the honest
+        // answer to a second click on a four-minute button.
+        return reply.code(202).send({ ok: true, started, ...status });
+      },
+    );
+
+    /**
+     * Where the current or last reconcile pass is up to.
+     *
+     * Read-only and cheap, because it is polled: it reads one `settings` row
+     * and never touches MangaDex. `chapters:read` like the dry run it reports
+     * on, so a monitoring probe or the bot can watch a pass it did not start.
+     */
+    scope.get(
+      "/api/v1/admin/chapters/reconcile",
+      { preHandler: requireScope("chapters:read") },
+      async () => {
+        if (!ctx.md) {
+          return { ok: true, state: "idle", note: "this deployment has no MangaDex client" };
+        }
+        return { ok: true, ...(await runner(ctx.md).status()) };
       },
     );
 

@@ -35,6 +35,8 @@ const API = "/api/v1/admin";
 const CSRF_HEADER = "x-requested-with";
 const CSRF_VALUE = "publoader-dash";
 const SUMMARY_MS = 10_000;
+/** How often the reconcile card asks how a running pass is getting on. */
+const RECONCILE_POLL_MS = 2_000;
 const WILDCARD = "*";
 const NAV_KEY = "publoader.nav.collapsed";
 
@@ -4121,6 +4123,100 @@ function reconcileCard(archive, reload) {
   }
   const output = el("div", { class: "dim small" });
   let checked = null;
+  /** Set while this card is following a pass, so two clicks do not poll twice. */
+  let following = false;
+
+  /**
+   * Start a pass and follow it to the end.
+   *
+   * The request only *starts* the work. A pass is minutes long -- the group
+   * walk alone is ~124 MangaDex requests at the client's rate limit -- and a
+   * request held open that long dies to the proxy in front of the API, which is
+   * what "Check keeps failing" was: not an error, a timeout with nothing to
+   * show. Now the server owns the pass, this polls it, and closing the tab
+   * abandons the watching rather than four minutes of MangaDex calls.
+   */
+  const runPass = async (body) => {
+    if (following) {
+      toast("A pass is already being followed here.", true);
+      return null;
+    }
+    following = true;
+    try {
+      const started = await api("/chapters/reconcile", { method: "POST", body });
+      if (started && started.started === false) {
+        toast("A pass was already running; following that one.", true);
+      }
+      return await follow();
+    } finally {
+      following = false;
+    }
+  };
+
+  /**
+   * Poll until the pass ends, drawing progress as it goes.
+   *
+   * `first` lets a caller that has already read the state hand it over rather
+   * than asking again; without it the mount check below would fetch twice, and
+   * the second answer could differ from the one it decided to follow on.
+   */
+  const follow = async (first) => {
+    let status = first;
+    // Never on the first turn: a card is built before it is inserted, so its
+    // nodes are legitimately detached at the moment this starts, and checking
+    // then would stop every poller before it made a single request.
+    let started = false;
+    for (;;) {
+      // Stop once this card has left the page. The pass itself carries on
+      // server-side -- that is the whole design -- but a poller for a card
+      // nobody is looking at is a request every two seconds forever, and
+      // navigating back would start a second one beside it.
+      if (started && !output.isConnected) return null;
+      started = true;
+      if (!status) status = await api("/chapters/reconcile");
+      if (status.state === "done" && status.report) {
+        render(status.report);
+        return status.report;
+      }
+      if (status.state === "failed") {
+        setChildren(output, el("p", { class: "error", text: `The pass failed: ${status.error}` }));
+        return null;
+      }
+      if (status.state === "idle") {
+        setChildren(
+          output,
+          el("p", { class: "error", text: "The pass is not running and left no report." }),
+        );
+        return null;
+      }
+      drawProgress(status.progress);
+      status = null;
+      await new Promise((resolve) => setTimeout(resolve, RECONCILE_POLL_MS));
+    }
+  };
+
+  /**
+   * What is happening right now.
+   *
+   * A count with no total during the walk, because MangaDex reports no total up
+   * front and inventing one would be the only dishonest number on the card.
+   */
+  const drawProgress = (progress) => {
+    checked = null;
+    setChildren(
+      output,
+      el("div", {}, [
+        el("div", { text: progress ? progress.detail : "starting" }),
+        el("div", {
+          class: "dim small",
+          text:
+            (progress && progress.total !== null
+              ? `${progress.done} of ${progress.total}. `
+              : "") + "This takes a few minutes. It keeps going if you leave the page.",
+        }),
+      ]),
+    );
+  };
 
   const render = (report) => {
     checked = report;
@@ -4186,35 +4282,43 @@ function reconcileCard(archive, reload) {
       text: "Track them",
       onclick: async (event) => {
         const button = event.currentTarget;
-        if (!checked) {
-          toast("Check first; nothing should be written before you have seen the count.", false);
-          return;
-        }
-        const adopting = checked.untrackedFound ?? 0;
-        if (adopting === 0) {
+        // Deliberately NOT gated on a prior Check, unlike Record them. Check is
+        // a four-minute pass, so requiring it meant paying for the walk twice
+        // to do one thing; and the discipline it enforces is about writes that
+        // cannot be inspected afterwards. This one only ever ADDS rows, for
+        // chapters MangaDex says our own group published, and every row it adds
+        // is marked `adopted` and listed on the page below. If the count still
+        // matters first, Check is right there.
+        const seen = checked ? (checked.untrackedFound ?? 0) : null;
+        if (seen === 0) {
           toast("Nothing to track; every live chapter on MangaDex already has a row.", true);
           return;
         }
         // Naming the extensions that recovered no id is the point of the
         // dialog: those rows land visible but still outside postedChapterIds,
         // and that is the half an operator would otherwise never learn.
-        const blind = (checked.groups ?? [])
-          .filter((g) => g.untracked > 0 && !g.idRule)
-          .map((g) => g.extension);
+        const blind = checked
+          ? (checked.groups ?? []).filter((g) => g.untracked > 0 && !g.idRule).map((g) => g.extension)
+          : [];
         if (
           !(await confirmDialog({
             title: "Track the chapters MangaDex has and we do not",
-            lead: `${adopting} live chapter(s) will be recorded as uploaded.`,
+            lead:
+              seen === null
+                ? "Every live chapter MangaDex has for our groups that has no row here will be " +
+                  "recorded as uploaded. Reading MangaDex takes a few minutes."
+                : `${seen} live chapter(s) will be recorded as uploaded.`,
             points: [
               "Nothing is sent to MangaDex; this only corrects our record of it.",
               "Only chapters no table here knows about are added; a chapter this platform " +
                 "actually uploaded keeps the row it already has, with its publisher-side ids.",
-              `${checked.idsRecorded ?? 0} of them recover a publisher chapter id, which is what ` +
-                "stops the extension re-fetching the chapter on every run.",
+              "Where the publisher's chapter id can be read from its URL it is recorded too, " +
+                "which is what stops the extension re-fetching the chapter on every run.",
               blind.length
                 ? `No chapter id can be read from the URLs of: ${blind.join(", ")}. Those rows will ` +
                   "be added without one, so those chapters stay outside postedChapterIds."
-                : "Every one of them recovers a chapter id.",
+                : "Rows for an extension whose ids cannot be read from its URLs are added without " +
+                  "one, and the report below names it.",
             ],
             confirmLabel: "Add the rows",
           }))
@@ -4224,15 +4328,13 @@ function reconcileCard(archive, reload) {
         await act(
           "chapters.reconcile.adopt",
           async () => {
-            render(
-              await api("/chapters/reconcile", {
-                method: "POST",
-                body: { dryRun: false, skipDeleted: true, skipUnavailable: true },
-              }),
-            );
-            checked = null;
+            const report = await runPass({
+              dryRun: false,
+              skipDeleted: true,
+              skipUnavailable: true,
+            });
             // The listing below now has rows it did not have a moment ago.
-            reload();
+            if (report) reload();
           },
           { button },
         );
@@ -4277,20 +4379,39 @@ function reconcileCard(archive, reload) {
         await act(
           "chapters.reconcile.apply",
           async () => {
-            render(
-              await api("/chapters/reconcile", {
-                method: "POST",
-                body: { dryRun: false, skipAdopt: true },
-              }),
-            );
-            checked = null;
+            const report = await runPass({ dryRun: false, skipAdopt: true });
             // The listing below now has rows it did not have a moment ago.
-            reload();
+            if (report) reload();
           },
           { button },
         );
       },
     });
+
+  // A pass outlives the page that started it, so the card asks once on mount
+  // whether one is in flight and picks it up. Without this, navigating away and
+  // back showed an idle card over four minutes of running MangaDex calls, and
+  // the obvious next move was to start a second one.
+  void (async () => {
+    try {
+      const status = await api("/chapters/reconcile");
+      if (status.state === "running" && !following) {
+        following = true;
+        try {
+          await follow(status);
+        } finally {
+          following = false;
+        }
+      } else if (status.state === "done" && status.report) {
+        // The last pass's numbers, so Record them has something to gate on
+        // without re-walking MangaDex.
+        render(status.report);
+      }
+    } catch {
+      // A card that cannot ask is just a card with no report yet; the buttons
+      // still work and will say so themselves.
+    }
+  })();
 
   return card(
     "Reconcile with MangaDex",
@@ -4321,7 +4442,7 @@ function reconcileCard(archive, reload) {
           onclick: (event) =>
             act(
               "chapters.reconcile.check",
-              async () => render(await api("/chapters/reconcile", { method: "POST", body: { dryRun: true } })),
+              () => runPass({ dryRun: true }),
               { button: event.currentTarget },
             ),
         }),

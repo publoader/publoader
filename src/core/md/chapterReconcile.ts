@@ -165,11 +165,35 @@ export interface ReconcileReport {
   hiddenOnMangadex: string[];
 }
 
+/**
+ * Where a run is up to, for something that has to say so while it happens.
+ *
+ * A full pass is minutes long -- the group walk alone is ~124 MangaDex requests
+ * at the client's rate limit -- so every caller of this class is either polling
+ * it or watching a spinner. `total` is null during the walk because MangaDex
+ * reports no count up front; "collected so far" is the only honest number until
+ * the walk ends.
+ */
+export interface ReconcileProgress {
+  phase: "starting" | "walking" | "archiving" | "adopting" | "sweeping" | "done";
+  /** The extension whose group is being walked, when one is. */
+  extension: string | null;
+  done: number;
+  total: number | null;
+  /** One line an operator can read without knowing the phase names. */
+  detail: string;
+}
+
 export interface ReconcileDeps {
   prisma: PrismaClient;
   md: MdExtendedApi;
   log: Logger;
   audit: AuditLog;
+  /**
+   * Called as the run advances. Never awaited: a slow sink must not pace the
+   * run, and a throwing one must not fail it.
+   */
+  onProgress?: (progress: ReconcileProgress) => void;
 }
 
 /** uploaded_chapters rows held in memory at once while sweeping. */
@@ -213,6 +237,21 @@ export class ChapterReconciler {
 
   constructor(private readonly deps: ReconcileDeps) {}
 
+  /**
+   * Report progress, swallowing anything the sink throws.
+   *
+   * A reconcile pass is minutes of MangaDex calls; losing all of it because a
+   * progress write hit a closed database connection would be a worse failure
+   * than showing a stale number.
+   */
+  private say(progress: ReconcileProgress): void {
+    try {
+      this.deps.onProgress?.(progress);
+    } catch (error) {
+      this.deps.log.warn({ error }, "reconcile progress sink threw");
+    }
+  }
+
   async run(options: ReconcileOptions): Promise<ReconcileReport> {
     const report: ReconcileReport = {
       dryRun: options.dryRun,
@@ -235,10 +274,25 @@ export class ChapterReconciler {
     // sweep costs one HTTP call per row it cannot rule out.
     const seenOnMd = new Set<string>();
 
-    for (const { extension, groupId } of await this.groups(options.extensions ?? [])) {
+    this.say({
+      phase: "starting",
+      extension: null,
+      done: 0,
+      total: null,
+      detail: "asking which groups we have uploaded to",
+    });
+    const groups = await this.groups(options.extensions ?? []);
+    for (const { extension, groupId } of groups) {
       report.groups.push(await this.discoverGroup(extension, groupId, options, report, seenOnMd));
     }
     if (!options.skipDeleted) await this.sweepUploaded(options, report, seenOnMd);
+    this.say({
+      phase: "done",
+      extension: null,
+      done: report.groups.length,
+      total: groups.length,
+      detail: "finished",
+    });
 
     if (!options.dryRun) {
       await this.deps.audit.record(options.actor, "chapters.reconcile", "mangadex", {
@@ -293,7 +347,26 @@ export class ChapterReconciler {
     report: ReconcileReport,
     seenOnMd: Set<string>,
   ): Promise<ReconcileGroup> {
-    const { all, served } = await this.deps.md.chapterAvailabilityForGroup(groupId);
+    // The walk is the slow part by a wide margin: two full paginations at the
+    // MangaDex rate limit, ~124 requests and about four minutes on the live
+    // group. Reporting per page is the difference between a progress bar and a
+    // spinner nobody can distinguish from a hang.
+    const { all, served } = await this.deps.md.chapterAvailabilityForGroup(
+      groupId,
+      (collected, pass) =>
+        this.say({
+          phase: "walking",
+          extension,
+          done: collected,
+          // MangaDex reports no total up front, so there is nothing honest to
+          // put here until the walk is over.
+          total: null,
+          detail:
+            pass === "all"
+              ? `reading ${extension}'s chapters on MangaDex: ${collected} so far`
+              : `checking which of ${extension}'s chapters MangaDex still serves: ${collected} so far`,
+        }),
+    );
 
     const carded: [string, MdEntity][] = [];
     const live: [string, MdEntity][] = [];
@@ -324,7 +397,16 @@ export class ChapterReconciler {
     // work it is about to do.
     let recorded = 0;
     if (!options.skipUnavailable) {
+      let seen = 0;
       for (const [mdChapterId, entity] of carded) {
+        seen += 1;
+        this.say({
+          phase: "archiving",
+          extension,
+          done: seen,
+          total: carded.length,
+          detail: `archiving ${extension}'s carded chapters: ${seen} of ${carded.length}`,
+        });
         report.unavailableFound += 1;
         if (await this.alreadyArchived(mdChapterId)) continue;
         recorded += 1;
@@ -366,6 +448,13 @@ export class ChapterReconciler {
     adoptedWithId: number;
     idRule: ChapterIdUrlRule | null;
   }> {
+    this.say({
+      phase: "adopting",
+      extension,
+      done: 0,
+      total: live.length,
+      detail: `working out which of ${extension}'s ${live.length} live chapter(s) we already have`,
+    });
     const missing = await this.withoutRows(live.map(([id]) => id));
     const candidates = live.filter(([id]) => missing.has(id));
     report.untrackedFound += candidates.length;
@@ -426,6 +515,13 @@ export class ChapterReconciler {
       }
     }
 
+    this.say({
+      phase: "adopting",
+      extension,
+      done: 0,
+      total: rows.length,
+      detail: `recording ${rows.length} untracked chapter(s) of ${extension}`,
+    });
     // A dry run reports what it would write, as the archiving pass above does.
     // The counts can only be exact for `uploaded_chapters`, whose ids were just
     // checked; `uploaded_ids` may hold some of these already, so its dry-run
@@ -608,6 +704,13 @@ export class ChapterReconciler {
       if (rows.length === 0) break;
       cursor = rows[rows.length - 1]?.id;
       report.scanned += rows.length;
+      this.say({
+        phase: "sweeping",
+        extension: null,
+        done: report.scanned,
+        total: null,
+        detail: `checking our own rows against MangaDex: ${report.scanned} so far`,
+      });
 
       for (const row of rows) {
         if (seenOnMd.has(row.mdChapterId)) {
