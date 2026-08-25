@@ -1364,13 +1364,15 @@ first and only then offers to queue.
 
 ---
 
-## Reconcile the archives with MangaDex
+## Reconcile our record of the chapters with MangaDex
 
-`unavailable_chapters` and `deleted_chapters` are written by the upload-task
-workers at the moment those workers act. That makes them a log of actions rather
-than a description of the catalogue, and the two come apart whenever the log is
-incomplete: a database restored without them, a migration, work done before the
-tables existed. MangaDex still carries the evidence; nothing was reading it back.
+Every chapter table here is written by this platform as it acts: `uploaded_chapters`
+when a run uploads something, `unavailable_chapters` and `deleted_chapters` by the
+upload-task workers at the moment those workers act. That makes them a log of *our
+actions* rather than a description of the catalogue, and the two come apart whenever
+the log is incomplete: a database restored without them, a migration, work done
+before the tables existed, or an upload history younger than the catalogue itself.
+MangaDex still carries the evidence; nothing was reading it back.
 
 **What "marked unavailable" looks like on MangaDex.** An external chapter, the
 only kind this platform publishes, normally has no pages: the reader follows
@@ -1388,14 +1390,17 @@ chapters, every one with exactly one page, against 6108 live ones with none. The
 it at the series or domain root rather than clearing it, which is why the page
 count is the signal and the URL is not.
 
-`padmin chapters reconcile` rebuilds the archives from that. Two passes, and
-they are not variations of one thing:
+`padmin chapters reconcile` rebuilds all three tables from that. Three passes,
+and they are not variations of one thing:
 
 - **discover**: walk our groups' chapters on MangaDex and archive the carded
   ones. This deliberately does not start from `uploaded_chapters`: on a database
   whose upload history is younger than the catalogue, the carded chapters have
   no row there. Measured on the live deployment, the overlap was zero. The
   archive row is seeded from the MangaDex record itself.
+- **adopt**: the same walk's *live* chapters, the ones with no row of ours,
+  recorded into `uploaded_chapters`. See [Adopting the live
+  catalogue](#adopting-the-live-catalogue) below.
 - **reconcile**: sweep `uploaded_chapters` for rows MangaDex no longer has, and
   archive those as deleted. Deletions can only be found in this direction: a
   chapter that is gone cannot be enumerated, so our own memory of uploading it
@@ -1405,12 +1410,71 @@ The default is a dry run that writes nothing:
 
 ```bash
 padmin chapters reconcile
-#   EXTENSION   GROUP     ON MD   CARDED   NEW   MD-HIDDEN
-#   mangaplus   4f1de6a2   6220      112   112          24
-#   scanned 155 uploaded row(s)
+#   EXTENSION   GROUP     ON MD   CARDED   NEW   MD-HIDDEN   LIVE   UNTRACKED   ADOPTED   WITH ID
+#   mangaplus   4f1de6a2   6220      112   112          24   6084        5593      5593      5593
+#   mangaplus: chapter id read as the last 1 path segment(s) of the chapter URL
+#   (100% of 491 existing row(s) agree)
+#   scanned 491 uploaded row(s), 491 of them answered by the group walk
 #   would record 112 unavailable and 0 deleted (found 112 / 0; the rest were
-#   already archived); re-run with --apply to write
+#   already archived), and would adopt 5593 live chapter(s) (5593 with a
+#   recovered chapter id; 5593 untracked in total); re-run with --apply to write
 ```
+
+### Adopting the live catalogue
+
+`uploaded_chapters` records uploads *this* platform performed, seeded once from
+the previous deployment's Mongo `uploaded` collection. That collection never
+held the whole catalogue, so most of what our groups have on MangaDex — years of
+it, uploaded by the predecessor — has no row here at all. On the live deployment
+that is a few hundred rows against 6220 chapters MangaDex holds for the mangaplus
+group. Nothing was closing that gap: the discover pass enumerated every one of
+those chapters and then threw the live ones away.
+
+**The gap is not cosmetic.** `uploaded_ids` is what `/api/v1/worker/jobs/claim`
+hands an extension as `postedChapterIds`, and extensions use it to decide they
+have nothing to fetch — mangaplus's `latest-chapter-posted` skip is exactly this.
+A chapter with no id recorded is a detail call the extension makes again on every
+run, forever, for a chapter uploaded years ago.
+
+So adoption writes both:
+
+- the `uploaded_chapters` row, from the MangaDex record: chapter number, title,
+  volume, language, `readableAt`, the publisher `externalUrl`, the MangaDex manga
+  and group ids, and the formatted title so the dashboard shows a series name
+  rather than another bare UUID;
+- an `uploaded_ids` row whenever the publisher's own chapter id can be recovered.
+
+**Recovering the publisher chapter id.** MangaDex holds the publisher's URL but
+never the publisher's id, and nothing in a manifest describes how one sits inside
+the other. The rows we already have are worked examples of exactly that
+relationship, so the rule is *measured* off the extension's own history rather
+than assumed: on the live deployment all 491 mangaplus rows say "the id is the
+last path segment", and that is what gets applied to the other 5593.
+
+It fails closed, and says so. Fewer than five examples, examples that disagree
+about where the id sits, or ids that are not in the URL at all, and there is no
+rule: the row is still written, with a NULL `chapter_id`, and the command prints
+which extension it could not answer for. A wrong id in `uploaded_ids` would tell
+an extension a chapter is posted when it is not, which is an upload silently
+never made, so "no answer" has to be cheaper than "an answer that might be
+wrong". Rows adopted by an earlier run are excluded from the evidence, so one
+early mis-parse cannot become its own justification.
+
+**It never overwrites.** Adoption only inserts rows for chapters no table here
+knows about. A chapter this platform actually uploaded carries publisher-side
+identifiers MangaDex has never known about — the source chapter and manga ids,
+the series URL — and a sweep that upserted would replace those with the
+less-informed version. Chapters already archived as unavailable or deleted are
+skipped too, so adoption cannot quietly undo the archiving pass that just ran.
+An adopted row is marked `extra.adopted = "mangadex-reconcile"`, which is the
+only thing distinguishing it from a row written because we performed the upload.
+
+**One knock-on worth knowing.** The deletion sweep costs one MangaDex call per
+row it cannot rule out, so a table thousands of rows larger would have made
+`reconcile` unusable. It now skips any row the group walk already saw — MangaDex
+just enumerated that group, so those rows cannot be deletions — and reports the
+count as `answered by the group walk`. Only rows outside every walked group
+still cost a call.
 
 Read it before applying it. `deleted` is the row that matters: it claims a
 chapter is gone forever, so it is only ever recorded on a 404 from the chapter's
@@ -1440,19 +1504,21 @@ resurrected as merely unavailable.
 | `--apply` | Write. Without it nothing is written. |
 | `--extension <name...>` | Only these extensions. |
 | `--skip-deleted` | Skip the `uploaded_chapters` sweep: the slow half on a large table, and the only pass that can find deletions. |
+| `--skip-adopt` | Report the untracked live chapters in the table above and record none of them. |
 
 **Who can run it.** The dry run needs `chapters:read`, so any scoped token,
 including the bot's, can ask. `/reconcile` in Discord reports the same counts.
 Applying takes the same guard as every other mutating chapter route: ADMIN or
 above, and closed to api tokens, so it is the dashboard (Chapters → the
-unavailable or deleted archive → **Reconcile with MangaDex**) or the break-glass
-`ADMIN_TOKEN`.
+uploaded, unavailable or deleted archive → **Reconcile with MangaDex**) or the
+break-glass `ADMIN_TOKEN`.
 
 **Why this one writes directly** instead of queueing an upload task like every
 other action on a published chapter: it changes nothing on MangaDex. Queueing
-would be actively wrong: every chapter it finds is already carded or already
-gone, so running the workers over them would re-upload cards and re-issue
-deletes for work that is already done.
+would be actively wrong: a chapter it finds is already carded, already gone, or
+already live and merely unrecorded, so running the workers over them would
+re-upload cards, re-issue deletes and re-upload chapters for work that is
+already done.
 
 > One MangaDex API trap is worth knowing, because it decides how the MD-HIDDEN
 > column is measured. `isUnavailable` on a chapter looks like the direct answer

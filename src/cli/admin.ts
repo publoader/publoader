@@ -589,11 +589,17 @@ const chapters = program
 
 chapters
   .command("reconcile")
-  .description("record the chapters already marked unavailable on MangaDex, and the deleted ones")
-  .option("--apply", "write the archive rows (default is a dry run that writes nothing)")
+  .description("bring our record of the chapters back in line with what MangaDex holds")
+  .option("--apply", "write the rows (default is a dry run that writes nothing)")
   .option("--extension <name...>", "only these extensions (default: every group we have uploaded to)")
   .option("--skip-deleted", "skip the uploaded_chapters sweep, which is the only pass that finds deletions")
-  .action(async (opts: { apply?: boolean; extension?: string[]; skipDeleted?: boolean }) => {
+  .option("--skip-adopt", "report the untracked live chapters without recording any of them")
+  .action(async (opts: {
+    apply?: boolean;
+    extension?: string[];
+    skipDeleted?: boolean;
+    skipAdopt?: boolean;
+  }) => {
     const res = await api<{
       dryRun: boolean;
       groups: {
@@ -603,10 +609,19 @@ chapters
         carded: number;
         recorded: number;
         hiddenOnMangadex: number;
+        live: number;
+        untracked: number;
+        adopted: number;
+        adoptedWithId: number;
+        idRule: { segments: number; samples: number; agreement: number } | null;
       }[];
       unavailableFound: number;
       unavailableRecorded: number;
+      untrackedFound: number;
+      adoptedRecorded: number;
+      idsRecorded: number;
       scanned: number;
+      skippedByGroupWalk: number;
       deletedFound: number;
       deletedRecorded: number;
       hiddenOnMangadex: string[];
@@ -616,6 +631,7 @@ chapters
         dryRun: opts.apply !== true,
         extensions: opts.extension ?? [],
         skipDeleted: opts.skipDeleted === true,
+        skipAdopt: opts.skipAdopt === true,
       },
     });
 
@@ -626,9 +642,38 @@ chapters
       { header: "CARDED", get: (g) => g["carded"] },
       { header: "NEW", get: (g) => g["recorded"] },
       { header: "MD-HIDDEN", get: (g) => g["hiddenOnMangadex"] },
+      { header: "LIVE", get: (g) => g["live"] },
+      { header: "UNTRACKED", get: (g) => g["untracked"] },
+      { header: "ADOPTED", get: (g) => g["adopted"] },
+      { header: "WITH ID", get: (g) => g["adoptedWithId"] },
     ], "no extension has uploaded anything, so there are no groups to ask about");
 
-    console.error(`  scanned ${res.scanned} uploaded row(s)`);
+    // The rule is a measurement, not a setting, so it is shown wherever it
+    // decided something: an extension whose own rows do not agree on where its
+    // chapter ids sit gets adopted rows with no chapter_id, and that silently
+    // costs the extension the `postedChapterIds` skip on every future run.
+    for (const group of res.groups) {
+      if (group.untracked === 0) continue;
+      if (group.idRule === null) {
+        console.error(
+          `  ${group.extension}: no chapter id could be recovered from its URLs; ` +
+            "adopted rows carry no chapter_id, so those chapters stay outside postedChapterIds",
+        );
+        continue;
+      }
+      console.error(
+        `  ${group.extension}: chapter id read as the last ${group.idRule.segments} ` +
+          `path segment(s) of the chapter URL (${Math.round(group.idRule.agreement * 100)}% of ` +
+          `${group.idRule.samples} existing row(s) agree)`,
+      );
+    }
+
+    console.error(
+      `  scanned ${res.scanned} uploaded row(s)` +
+        (res.skippedByGroupWalk > 0
+          ? `, ${res.skippedByGroupWalk} of them answered by the group walk`
+          : ""),
+    );
     if (res.hiddenOnMangadex.length > 0) {
       // Never archived: MangaDex is refusing to serve these, but they carry no
       // card of ours, so they are candidates for an UNAVAILABLE task rather
@@ -645,7 +690,9 @@ chapters
     ok(
       `${res.dryRun ? "would record" : "recorded"} ` +
         `${res.unavailableRecorded} unavailable and ${res.deletedRecorded} deleted ` +
-        `(found ${res.unavailableFound} / ${res.deletedFound}; the rest were already archived)` +
+        `(found ${res.unavailableFound} / ${res.deletedFound}; the rest were already archived), ` +
+        `and ${res.dryRun ? "would adopt" : "adopted"} ${res.adoptedRecorded} live chapter(s) ` +
+        `(${res.idsRecorded} with a recovered chapter id; ${res.untrackedFound} untracked in total)` +
         (res.dryRun ? "; re-run with --apply to write" : ""),
     );
   });

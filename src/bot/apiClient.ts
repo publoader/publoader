@@ -321,10 +321,18 @@ export interface ChapterReconcileReport {
     carded: number;
     recorded: number;
     hiddenOnMangadex: number;
+    live: number;
+    untracked: number;
+    adopted: number;
+    adoptedWithId: number;
   }[];
   unavailableFound: number;
   unavailableRecorded: number;
+  untrackedFound: number;
+  adoptedRecorded: number;
+  idsRecorded: number;
   scanned: number;
+  skippedByGroupWalk: number;
   deletedFound: number;
   deletedRecorded: number;
   hiddenOnMangadex: string[];

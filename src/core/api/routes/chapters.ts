@@ -514,9 +514,10 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
      * The one endpoint here that does NOT queue an upload task, and the reason
      * it is allowed to write directly: it changes nothing on MangaDex. It reads
      * the catalogue and corrects our record of it. Queueing would be actively
-     * wrong: every chapter it finds is already unavailable or already gone, so
-     * running the workers over them would re-upload cards and re-issue deletes
-     * for work MangaDex did on its own.
+     * wrong: a chapter it finds is already unavailable, already gone, or
+     * already live and merely unrecorded, so running the workers over them
+     * would re-upload cards, re-issue deletes and re-upload chapters for work
+     * that is already done.
      *
      * The auth split is deliberate and is the only one in this module. A dry
      * run reads MangaDex and reports, so it sits at `chapters:read` and any
@@ -536,6 +537,8 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
             /** Skip the uploaded_chapters sweep: the slow half, and the only
              *  one that can find deletions. */
             skipDeleted: z.boolean().default(false),
+            /** Report the untracked live chapters without adopting any of them. */
+            skipAdopt: z.boolean().default(false),
           }),
           req.body ?? {},
         );
@@ -564,6 +567,7 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
           dryRun: body.dryRun,
           extensions: body.extensions,
           skipDeleted: body.skipDeleted,
+          skipAdopt: body.skipAdopt,
           actor: actor(req),
         });
         return { ok: true, ...report };

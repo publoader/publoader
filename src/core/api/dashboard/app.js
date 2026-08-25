@@ -4102,11 +4102,13 @@ VIEWS.chapters = (route) => {
 };
 
 /**
- * Bring the archives back in line with what MangaDex actually holds.
+ * Bring our record of the chapters back in line with what MangaDex actually
+ * holds.
  *
- * Only on the two archives it can write, because offering it while reading
- * `uploaded` or `edited` would imply it reconciles those, and it does not; it
- * moves rows *into* unavailable and deleted.
+ * On `uploaded` as well as the two archives, because it writes all three now:
+ * the adoption pass records the live chapters MangaDex has that this platform
+ * never uploaded, and `uploaded` is the table that is missing them. Still not
+ * on `edited`, which it does not touch.
  *
  * Check first, then apply, and never the other way round: the check is the only
  * thing that says how many rows are about to move, and unlike the bulk actions
@@ -4114,13 +4116,17 @@ VIEWS.chapters = (route) => {
  * has left `uploaded_chapters`.
  */
 function reconcileCard(archive, reload) {
-  if (archive !== "unavailable" && archive !== "deleted") return el("span", {});
+  if (archive !== "unavailable" && archive !== "deleted" && archive !== "uploaded") {
+    return el("span", {});
+  }
   const output = el("div", { class: "dim small" });
   let checked = null;
 
   const render = (report) => {
     checked = report;
-    const groups = (report.groups ?? []).filter((g) => g.carded > 0 || g.hiddenOnMangadex > 0);
+    const groups = (report.groups ?? []).filter(
+      (g) => g.carded > 0 || g.hiddenOnMangadex > 0 || g.untracked > 0,
+    );
     setChildren(
       output,
       el("div", {}, [
@@ -4130,13 +4136,31 @@ function reconcileCard(archive, reload) {
             `chapter(s) are not in the archives ` +
             `(found ${report.unavailableFound} and ${report.deletedFound}; the rest are already recorded).`,
         }),
+        el("div", {
+          text:
+            `${report.untrackedFound ?? 0} live chapter(s) on MangaDex have no row here at all; ` +
+            `${report.idsRecorded ?? 0} of them would recover a publisher chapter id.`,
+        }),
         ...groups.map((g) =>
           el("div", {
             text:
               `${g.extension}: ${g.carded} of ${g.total} already carded on MangaDex, ${g.recorded} new` +
+              (g.untracked > 0 ? `, ${g.untracked} of ${g.live} live untracked` : "") +
               (g.hiddenOnMangadex > 0 ? `, ${g.hiddenOnMangadex} live but unserved` : ""),
           }),
         ),
+        // An adopted row with no chapter id is the quiet failure here: it shows
+        // up in the listing and still leaves the extension re-fetching the
+        // chapter forever, so say so rather than let the count imply success.
+        ...groups
+          .filter((g) => g.untracked > 0 && !g.idRule)
+          .map((g) =>
+            el("div", {
+              text:
+                `${g.extension}: no chapter id can be read from its chapter URLs, so adopted rows ` +
+                "will carry none and those chapters stay outside postedChapterIds.",
+            }),
+          ),
         report.hiddenOnMangadex?.length
           ? el("div", {
               text:
@@ -4156,9 +4180,10 @@ function reconcileCard(archive, reload) {
       el("p", {
         class: "dim small",
         text:
-          "These archives record what the workers did as they did it. This rebuilds them from " +
-          "MangaDex itself: the chapters already carrying an unavailable card, and the ones " +
-          "that are gone, so history the tables never captured is recorded too.",
+          "These tables record what the workers did as they did it, so they describe this " +
+          "platform's own history rather than the catalogue. This rebuilds them from MangaDex " +
+          "itself: the chapters already carrying an unavailable card, the ones that are gone, " +
+          "and the live ones we have never had a row for.",
       }),
       el(
         "div",
@@ -4183,15 +4208,20 @@ function reconcileCard(archive, reload) {
               toast("Check first; nothing should be written before you have seen the count.", false);
               return;
             }
-            const total = checked.unavailableRecorded + checked.deletedRecorded;
+            const moving = checked.unavailableRecorded + checked.deletedRecorded;
+            const adopting = checked.untrackedFound ?? 0;
             if (
               !(await confirmDialog({
                 title: "Record what MangaDex changed",
-                lead: `${total} chapter(s) will move into the unavailable and deleted archives.`,
+                lead:
+                  `${moving} chapter(s) will move into the unavailable and deleted archives, and ` +
+                  `${adopting} live chapter(s) will be recorded as uploaded.`,
                 points: [
                   "Nothing is sent to MangaDex; this only corrects our record of it.",
                   "Rows that move leave uploaded_chapters, so a chapter lives in exactly one table.",
                   "Chapters already archived keep the date they were first recorded.",
+                  "Adoption only adds rows for chapters no table here knows about; a chapter this " +
+                    "platform actually uploaded keeps the row it already has.",
                 ],
                 confirmLabel: "Record them",
               }))

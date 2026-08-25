@@ -1330,7 +1330,7 @@ const commands: BotCommand[] = [
   },
   {
     name: "reconcile",
-    description: "Check which chapters are marked unavailable or deleted on MangaDex.",
+    description: "Check how far our record of the chapters has drifted from MangaDex.",
     // "read" although it walks the whole catalogue: it reports and never
     // writes. Applying is closed to api tokens at the endpoint, so this command
     // could not write the rows even if it asked to; `padmin chapters
@@ -1339,7 +1339,7 @@ const commands: BotCommand[] = [
     ephemeral: true,
     builder: new SlashCommandBuilder()
       .setName("reconcile")
-      .setDescription("Check which chapters are marked unavailable or deleted on MangaDex.")
+      .setDescription("Check how far our record of the chapters has drifted from MangaDex.")
       .addStringOption((o) =>
         o
           .setName("extension")
@@ -1350,19 +1350,27 @@ const commands: BotCommand[] = [
       const extension = ctx.options.string("extension");
       const report = await ctx.api.reconcileChapters(ctx.actor, extension ? [extension] : []);
 
-      if (report.unavailableRecorded === 0 && report.deletedRecorded === 0) {
+      const missing =
+        report.unavailableRecorded + report.deletedRecorded + report.untrackedFound;
+      if (missing === 0) {
         return {
           text:
-            ":white_check_mark: Nothing to record; the archives already match MangaDex " +
-            `(${report.unavailableFound} unavailable and ${report.deletedFound} deleted, all known).`,
+            ":white_check_mark: Nothing to record; our record already matches MangaDex " +
+            `(${report.unavailableFound} unavailable and ${report.deletedFound} deleted, all known, ` +
+            "and every live chapter has a row).",
         };
       }
       const lines = report.groups
-        .filter((group) => group.carded > 0 || group.hiddenOnMangadex > 0)
+        .filter(
+          (group) => group.carded > 0 || group.hiddenOnMangadex > 0 || group.untracked > 0,
+        )
         .map(
           (group) =>
             `• **${group.extension}**: ${group.carded} of ${group.total} already carded, ` +
             `${group.recorded} not yet archived` +
+            (group.untracked > 0
+              ? `, and **${group.untracked}** of ${group.live} live chapter(s) have no row here`
+              : "") +
             (group.hiddenOnMangadex > 0
               ? `, ${group.hiddenOnMangadex} live but unserved by MangaDex`
               : ""),
@@ -1370,8 +1378,13 @@ const commands: BotCommand[] = [
       return {
         text:
           `:mag: **${report.unavailableRecorded}** unavailable and **${report.deletedRecorded}** ` +
-          `deleted chapter(s) are missing from the archives.\n` +
+          `deleted chapter(s) are missing from the archives, and **${report.untrackedFound}** ` +
+          "live chapter(s) on MangaDex are untracked here.\n" +
           (lines.length > 0 ? `${lines.join("\n")}\n` : "") +
+          (report.untrackedFound > 0
+            ? "An untracked chapter is not just invisible: its id never reaches the extension as " +
+              "`postedChapterIds`, so the extension re-fetches it on every run.\n"
+            : "") +
           (report.hiddenOnMangadex.length > 0
             ? `${report.hiddenOnMangadex.length} chapter(s) carry no card but MangaDex will not ` +
               "serve them, never archived; queue them unavailable if that is what you want.\n"
