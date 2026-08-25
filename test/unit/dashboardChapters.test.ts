@@ -303,6 +303,42 @@ function apiRoutes(): { match: RegExp; body: unknown | ((init?: { body?: string 
         ],
       },
     },
+    {
+      // Shaped like the live deployment's real answer: a catalogue far larger
+      // than our record of it, and a chapter-id rule the extension's own rows
+      // demonstrate. `unavailableRecorded`/`untrackedFound` are what the two
+      // buttons put in front of an operator before writing anything.
+      match: /\/chapters\/reconcile$/,
+      body: {
+        ok: true,
+        dryRun: true,
+        groups: [
+          {
+            extension: "mangaplus",
+            groupId: "4f1de6a2-0000-4000-8000-000000000000",
+            total: 6220,
+            carded: 112,
+            recorded: 112,
+            hiddenOnMangadex: 24,
+            live: 6084,
+            untracked: 5593,
+            adopted: 5593,
+            adoptedWithId: 5593,
+            idRule: { segments: 1, samples: 491, agreement: 1 },
+          },
+        ],
+        unavailableFound: 112,
+        unavailableRecorded: 112,
+        untrackedFound: 5593,
+        adoptedRecorded: 5593,
+        idsRecorded: 5593,
+        scanned: 491,
+        skippedByGroupWalk: 491,
+        deletedFound: 0,
+        deletedRecorded: 0,
+        hiddenOnMangadex: [],
+      },
+    },
   ];
 }
 
@@ -464,6 +500,101 @@ describe("dashboard chapter views", () => {
     button.click();
     await settle();
   }
+
+  /**
+   * The two Reconcile buttons.
+   *
+   * They exist because our record of the chapters and MangaDex's catalogue are
+   * different sizes: `uploaded_chapters` logs what this platform uploaded, and
+   * on the live deployment that is a few hundred rows against 6220 chapters
+   * MangaDex holds for the group. What is worth covering is not that a button
+   * posts -- it is that each button writes ONLY the table the operator is
+   * looking at. One "do everything" button meant clicking Record on the deleted
+   * archive and silently adding several thousand rows to `uploaded`, which is
+   * neither what the label says nor what is on screen.
+   */
+  describe("reconciling our record with MangaDex", () => {
+    const click = (label: string): void => {
+      const button = [...doc.querySelectorAll("button")].find(
+        (b: { textContent: string }) => b.textContent === label,
+      );
+      expect(button, `no button labelled ${label}`).toBeTruthy();
+      button.click();
+    };
+
+    const reconcileCalls = () =>
+      win.fetch.mock.calls.filter(([url]: [string]) => String(url).includes("/chapters/reconcile"));
+
+    const writes = () =>
+      reconcileCalls().filter(
+        ([, init]: [string, { body: string }]) => JSON.parse(init.body).dryRun === false,
+      );
+
+    it("offers Track them on the uploaded archive, and reports the size of the gap", async () => {
+      await goto("#/chapters");
+      expect(text()).toContain("Reconcile with MangaDex");
+
+      click("Check");
+      await settle();
+
+      const view = text();
+      // The number an operator is deciding on, and the reason it matters.
+      expect(view).toContain("5593");
+      expect(view).toContain("postedChapterIds");
+      expect(JSON.parse(reconcileCalls()[0][1].body)).toEqual({ dryRun: true });
+    });
+
+    it("tracks the untracked chapters without touching the other two tables", async () => {
+      await goto("#/chapters");
+      click("Check");
+      await settle();
+
+      click("Track them");
+      await settle();
+      // The confirm dialog stands between the click and any write.
+      click("Add the rows");
+      await settle(20);
+
+      expect(writes()).toHaveLength(1);
+      // skipUnavailable and skipDeleted are the whole point: the button says it
+      // tracks chapters, so it must not also archive carded ones, and the
+      // deletion sweep is one MangaDex call per row it cannot rule out.
+      expect(JSON.parse(writes()[0][1].body)).toEqual({
+        dryRun: false,
+        skipDeleted: true,
+        skipUnavailable: true,
+      });
+    });
+
+    it("refuses to write before the operator has seen a count", async () => {
+      await goto("#/chapters");
+      click("Track them");
+      await settle();
+
+      expect(writes()).toHaveLength(0);
+    });
+
+    it("archives from the unavailable view without adopting into uploaded", async () => {
+      await goto("#/chapters/unavailable");
+      click("Check");
+      await settle();
+
+      click("Record them");
+      await settle();
+      click("Move the rows");
+      await settle(20);
+
+      expect(writes()).toHaveLength(1);
+      // skipAdopt: the operator is looking at the unavailable archive, and
+      // 5593 new rows in a third table is not what "Record them" promises.
+      expect(JSON.parse(writes()[0][1].body)).toEqual({ dryRun: false, skipAdopt: true });
+    });
+
+    it("does not offer either write button on the edited archive, which it cannot rebuild", async () => {
+      await goto("#/chapters/edited");
+      expect(text()).not.toContain("Reconcile with MangaDex");
+    });
+  });
 
   it("opens the correction form prefilled with what MangaDex currently holds", async () => {
     await openEditForm();

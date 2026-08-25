@@ -594,11 +594,13 @@ chapters
   .option("--extension <name...>", "only these extensions (default: every group we have uploaded to)")
   .option("--skip-deleted", "skip the uploaded_chapters sweep, which is the only pass that finds deletions")
   .option("--skip-adopt", "report the untracked live chapters without recording any of them")
+  .option("--skip-unavailable", "report the carded chapters without archiving any of them")
   .action(async (opts: {
     apply?: boolean;
     extension?: string[];
     skipDeleted?: boolean;
     skipAdopt?: boolean;
+    skipUnavailable?: boolean;
   }) => {
     const res = await api<{
       dryRun: boolean;
@@ -632,6 +634,7 @@ chapters
         extensions: opts.extension ?? [],
         skipDeleted: opts.skipDeleted === true,
         skipAdopt: opts.skipAdopt === true,
+        skipUnavailable: opts.skipUnavailable === true,
       },
     });
 

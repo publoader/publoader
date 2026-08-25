@@ -1505,13 +1505,37 @@ resurrected as merely unavailable.
 | `--extension <name...>` | Only these extensions. |
 | `--skip-deleted` | Skip the `uploaded_chapters` sweep: the slow half on a large table, and the only pass that can find deletions. |
 | `--skip-adopt` | Report the untracked live chapters in the table above and record none of them. |
+| `--skip-unavailable` | Report the carded chapters and archive none of them. |
+
+The three skips make the three passes independently selectable, which is what
+lets each dashboard button run exactly the one that writes the table being
+looked at. `--skip-deleted --skip-unavailable` is adoption alone; `--skip-adopt`
+is the archiving passes alone.
 
 **Who can run it.** The dry run needs `chapters:read`, so any scoped token,
 including the bot's, can ask. `/reconcile` in Discord reports the same counts.
 Applying takes the same guard as every other mutating chapter route: ADMIN or
-above, and closed to api tokens, so it is the dashboard (Chapters → the
-uploaded, unavailable or deleted archive → **Reconcile with MangaDex**) or the
-break-glass `ADMIN_TOKEN`.
+above, and closed to api tokens, so it is the dashboard or the break-glass
+`ADMIN_TOKEN`.
+
+**In the dashboard** the card is **Chapters → Reconcile with MangaDex**, on
+every archive it can rebuild. **Check** reads MangaDex and reports the whole
+drift; the button beside it writes only the table you are looking at, and there
+is deliberately no button that writes all three:
+
+| Archive | Button | What it posts |
+|---|---|---|
+| On MangaDex (`uploaded`) | **Track them** | `skipDeleted`, `skipUnavailable` — adoption alone |
+| Unavailable, Deleted | **Record them** | `skipAdopt` — the archiving passes alone |
+| Edited | — | the card is not offered; nothing here rebuilds it |
+
+Check first: neither button writes before it has a count to show you, and the
+**Track them** dialog names any extension whose chapter ids could not be
+recovered, because those rows land visible and still outside `postedChapterIds`.
+A single "do everything" button was the obvious shape and the wrong one — it
+meant clicking **Record them** on the deleted archive and silently adding several
+thousand rows to `uploaded`, which is neither what the label says nor what is on
+screen.
 
 **Why this one writes directly** instead of queueing an upload task like every
 other action on a published chapter: it changes nothing on MangaDex. Queueing

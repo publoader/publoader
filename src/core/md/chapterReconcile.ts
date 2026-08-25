@@ -101,6 +101,8 @@ export interface ReconcileOptions {
   skipDeleted?: boolean;
   /** Skip adoption: report the untracked chapters, record none of them. */
   skipAdopt?: boolean;
+  /** Skip archiving the carded chapters: report them, move none of them. */
+  skipUnavailable?: boolean;
   /** Who asked, for the audit trail. */
   actor: string;
 }
@@ -315,13 +317,20 @@ export class ChapterReconciler {
       "group measured",
     );
 
+    // The carded chapters are still classified under `skipUnavailable` — they
+    // have to be, or they would fall through to adoption as ordinary live
+    // chapters — but nothing is counted or written for them. A caller that has
+    // asked for one pass should not have the other's numbers reported back as
+    // work it is about to do.
     let recorded = 0;
-    for (const [mdChapterId, entity] of carded) {
-      report.unavailableFound += 1;
-      if (await this.alreadyArchived(mdChapterId)) continue;
-      recorded += 1;
-      report.unavailableRecorded += 1;
-      if (!options.dryRun) await this.archiveUnavailable(mdChapterId, extension, groupId, entity);
+    if (!options.skipUnavailable) {
+      for (const [mdChapterId, entity] of carded) {
+        report.unavailableFound += 1;
+        if (await this.alreadyArchived(mdChapterId)) continue;
+        recorded += 1;
+        report.unavailableRecorded += 1;
+        if (!options.dryRun) await this.archiveUnavailable(mdChapterId, extension, groupId, entity);
+      }
     }
 
     const adoption = await this.adoptLive(extension, groupId, live, options, report);

@@ -539,6 +539,8 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
             skipDeleted: z.boolean().default(false),
             /** Report the untracked live chapters without adopting any of them. */
             skipAdopt: z.boolean().default(false),
+            /** Report the carded chapters without archiving any of them. */
+            skipUnavailable: z.boolean().default(false),
           }),
           req.body ?? {},
         );
@@ -568,6 +570,7 @@ export function registerChapterRoutes(app: FastifyInstance, ctx: AppContext): vo
           extensions: body.extensions,
           skipDeleted: body.skipDeleted,
           skipAdopt: body.skipAdopt,
+          skipUnavailable: body.skipUnavailable,
           actor: actor(req),
         });
         return { ok: true, ...report };

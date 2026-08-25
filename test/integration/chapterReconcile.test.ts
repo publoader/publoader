@@ -546,6 +546,63 @@ describe.skipIf(!dbReady())("chapter reconciliation", () => {
       expect(report.deletedRecorded).toBe(0);
     });
 
+    it("adopts without archiving when only that pass was asked for", async () => {
+      // What the dashboard's "Track them" button posts. Its label promises one
+      // thing, so a carded chapter must stay exactly where it is: an operator
+      // looking at the uploaded archive did not ask for rows to be moved into
+      // the unavailable one.
+      await seedHistory(10);
+      const orphan = chapterId(50);
+      const stillCarded = chapterId(51);
+      const md = fakeMd({
+        all: [atUrl(orphan, "4242"), carded(stillCarded)],
+        served: [orphan, stillCarded],
+      });
+
+      const report = await new ChapterReconciler({ prisma, md, log, audit }).run({
+        dryRun: false,
+        skipDeleted: true,
+        skipUnavailable: true,
+        actor: "tester",
+      });
+
+      expect(report.adoptedRecorded).toBe(1);
+      // Neither archived nor counted: reporting the other pass's numbers back
+      // as work about to be done is its own kind of wrong.
+      expect(report.unavailableFound).toBe(0);
+      expect(report.unavailableRecorded).toBe(0);
+      expect(await prisma.unavailableChapter.count()).toBe(0);
+      // And the carded chapter is still NOT adopted: it is excluded from the
+      // live set by the walk itself, not by the archiving pass, so switching
+      // that pass off must not let it fall through into `uploaded`.
+      expect(
+        await prisma.uploadedChapter.findUnique({ where: { mdChapterId: stillCarded } }),
+      ).toBeNull();
+    });
+
+    it("archives without adopting when only that pass was asked for", async () => {
+      // What the dashboard's "Record them" button posts, from the unavailable
+      // or deleted archive. 5593 new rows in a third table is not what
+      // "Record them" promises.
+      await seedHistory(10);
+      const orphan = chapterId(50);
+      const toCard = chapterId(51);
+      const md = fakeMd({ all: [atUrl(orphan, "4242"), carded(toCard)], served: [orphan, toCard] });
+
+      const report = await new ChapterReconciler({ prisma, md, log, audit }).run({
+        dryRun: false,
+        skipAdopt: true,
+        actor: "tester",
+      });
+
+      expect(report.unavailableRecorded).toBe(1);
+      expect(report.adoptedRecorded).toBe(0);
+      // Still reported, because the count is how an operator learns the other
+      // button has work waiting.
+      expect(report.untrackedFound).toBe(1);
+      expect(await prisma.uploadedChapter.findUnique({ where: { mdChapterId: orphan } })).toBeNull();
+    });
+
     it("is safe to run twice: the second pass finds nothing left to adopt", async () => {
       await seedHistory(10);
       const md = fakeMd({ all: [atUrl(chapterId(50), "4242")], served: [chapterId(50)] });
