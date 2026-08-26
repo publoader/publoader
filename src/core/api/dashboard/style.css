@@ -2245,5 +2245,99 @@ dialog::backdrop {
               bulk-bar pager card-preview doc-layout doc-sidebar doc-index
               doc-contents doc-link doc-main doc-body doc-meta markdown
               md-table md-left md-center md-right
+   steps      steps step step-fill step-label step-count step-note
    modifiers  dim dimmer small grow tight end wide inline over quiet active
    ========================================================================== */
+
+/* ---- reconcile step queue ------------------------------------------------
+   A reconcile pass is minutes long and used to be one status line, which is
+   barely distinguishable from a hang. These are its steps, listed before any
+   of them run and ticking over where they can be watched. Deliberately plain:
+   the row is the unit, and the bar is a fill behind it rather than a widget of
+   its own, so a queue of twenty reads as a list and not as twenty gauges.
+   -------------------------------------------------------------------------- */
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 8px;
+}
+
+.step {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--panel-2);
+  border-left: 2px solid var(--line-2);
+  overflow: hidden;
+}
+
+/* The fill sits behind the text rather than beside it: at a glance the row
+   itself is the bar, which keeps a long list readable. */
+.step-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent-bg);
+  border-right: 1px solid var(--accent-2);
+  transition: width 240ms linear;
+  pointer-events: none;
+}
+
+.step-label,
+.step-count,
+.step-note {
+  position: relative;
+}
+
+.step-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.step-count,
+.step-note {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.step-note {
+  flex: 1 1 auto;
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step.pending {
+  color: var(--dimmer);
+}
+
+.step.running {
+  border-left-color: var(--accent);
+  color: var(--text);
+}
+
+.step.done {
+  border-left-color: var(--ok-2);
+}
+
+.step.skipped {
+  border-left-color: var(--line-2);
+  color: var(--dimmer);
+}
+
+.step.failed {
+  border-left-color: var(--bad);
+  color: var(--bad);
+}
+
+.step.failed .step-fill {
+  background: var(--bad-bg);
+  border-right-color: var(--bad-2);
+}

@@ -325,13 +325,7 @@ function apiRoutes(): { match: RegExp; body: unknown | ((init?: { body?: string 
               beatAt: "2026-08-25T00:00:00Z",
               actor: "ardax",
               options: JSON.parse(init?.body ?? "{}"),
-              progress: {
-                phase: "starting",
-                extension: null,
-                done: 0,
-                total: null,
-                detail: "starting",
-              },
+              progress: { steps: [] },
             }
           : reconcileStatus(),
     },
@@ -371,12 +365,52 @@ function reconcileStatus(): unknown {
       beatAt: "2026-08-25T00:00:00Z",
       actor: "ardax",
       options: {},
+      // The whole plan, as the real thing reports it: declared up front, so the
+      // card shows what is done, what is going and what is still to come rather
+      // than one line that moves.
       progress: {
-        phase: "walking",
-        extension: "mangaplus",
-        done: 2400,
-        total: null,
-        detail: "reading mangaplus's chapters on MangaDex: 2400 so far",
+        steps: [
+          {
+            id: "groups",
+            label: "Find which groups we have uploaded to",
+            state: "done",
+            done: 1,
+            total: 1,
+            note: null,
+          },
+          {
+            id: "walk:g1",
+            label: "Read mangaplus's chapters on MangaDex",
+            state: "running",
+            done: 2400,
+            total: 12440,
+            note: "reading the catalogue",
+          },
+          {
+            id: "archive:g1",
+            label: "Archive mangaplus's carded and unavailable chapters",
+            state: "pending",
+            done: 0,
+            total: null,
+            note: null,
+          },
+          {
+            id: "adopt:g1",
+            label: "Record mangaplus's untracked chapters",
+            state: "pending",
+            done: 0,
+            total: null,
+            note: null,
+          },
+          {
+            id: "sweep",
+            label: "Check our own rows against MangaDex",
+            state: "pending",
+            done: 0,
+            total: null,
+            note: null,
+          },
+        ],
       },
     };
   }
@@ -684,13 +718,39 @@ describe("dashboard chapter views", () => {
       await settle();
 
       expect(polls().length).toBeGreaterThan(0);
-      expect(text()).toContain("reading mangaplus's chapters on MangaDex");
-      expect(text()).toContain("keeps going if you leave the page");
-      // No invented total: MangaDex reports none up front, so the card must not
-      // either. "2400 of ..." would be the only dishonest number on the page.
-      expect(text()).not.toContain("2400 of");
+      // The whole queue, not just the step that happens to be running: what is
+      // still to come is the half that says a four-minute wait is progressing
+      // rather than stuck.
+      const view = text();
+      expect(view).toContain("Read mangaplus's chapters on MangaDex");
+      expect(view).toContain("Record mangaplus's untracked chapters");
+      expect(view).toContain("Check our own rows against MangaDex");
+      // The running step carries a real count against MangaDex's own total.
+      expect(view).toContain("2400 / 12440");
       // And nothing was started: the card joined the pass rather than adding one.
       expect(writes()).toHaveLength(0);
+    }, 10_000);
+
+    it("draws a fill only for the running step, and only against a real total", async () => {
+      reconcileRunning = true;
+      await goto("#/chapters");
+      await settle();
+
+      const rows = [...doc.querySelectorAll(".step")];
+      expect(rows.length).toBe(5);
+      // One bar, on the one step that is going and has a denominator.
+      const fills = [...doc.querySelectorAll(".step-fill")];
+      expect(fills).toHaveLength(1);
+      expect(fills[0].style.width).toBe("19%");
+      // Pending steps show no count at all; a "0 / ?" on four rows is noise
+      // that reads as work that has failed to start.
+      const pending = rows.filter((row: { className: string }) =>
+        row.className.includes("pending"),
+      );
+      expect(pending).toHaveLength(3);
+      for (const row of pending) {
+        expect(row.querySelector(".step-count").textContent).toBe("");
+      }
     }, 10_000);
 
     it("archives from the unavailable view without adopting into uploaded", async () => {

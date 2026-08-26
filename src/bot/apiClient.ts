@@ -312,10 +312,20 @@ export interface ArchiveSeriesReport {
   capped: boolean;
 }
 
+/** Mirrors ReconcileStep in core/md/reconcilePlan.ts. */
+export interface ChapterReconcileStep {
+  id: string;
+  label: string;
+  state: "pending" | "running" | "done" | "skipped" | "failed";
+  done: number;
+  total: number | null;
+  note: string | null;
+}
+
 /** Mirrors ReconcileRunState in core/md/reconcileRunner.ts. */
 export interface ChapterReconcileStatus {
   state: "idle" | "running" | "done" | "failed";
-  progress?: { detail: string; done: number; total: number | null };
+  progress?: { steps: ChapterReconcileStep[] };
   report?: ChapterReconcileReport;
   error?: string;
 }

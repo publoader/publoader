@@ -12,6 +12,7 @@ import {
   learnChapterIdRule,
   type ChapterIdUrlRule,
 } from "./chapterIdFromUrl.js";
+import { ReconcilePlan, type ReconcileStep } from "./reconcilePlan.js";
 
 /**
  * Rebuild the chapter archives from what MangaDex actually holds.
@@ -166,22 +167,16 @@ export interface ReconcileReport {
 }
 
 /**
- * Where a run is up to, for something that has to say so while it happens.
+ * Where a run is up to: the whole step list, every time.
  *
  * A full pass is minutes long -- the group walk alone is ~124 MangaDex requests
- * at the client's rate limit -- so every caller of this class is either polling
- * it or watching a spinner. `total` is null during the walk because MangaDex
- * reports no count up front; "collected so far" is the only honest number until
- * the walk ends.
+ * at the client's rate limit -- so every caller of this class is watching it
+ * rather than waiting on it. One rolling status line was barely better than a
+ * spinner: it moved, but nothing said how much work there was or what was still
+ * to come. The plan says both. See reconcilePlan.ts.
  */
 export interface ReconcileProgress {
-  phase: "starting" | "walking" | "archiving" | "adopting" | "sweeping" | "done";
-  /** The extension whose group is being walked, when one is. */
-  extension: string | null;
-  done: number;
-  total: number | null;
-  /** One line an operator can read without knowing the phase names. */
-  detail: string;
+  steps: ReconcileStep[];
 }
 
 export interface ReconcileDeps {
@@ -190,8 +185,8 @@ export interface ReconcileDeps {
   log: Logger;
   audit: AuditLog;
   /**
-   * Called as the run advances. Never awaited: a slow sink must not pace the
-   * run, and a throwing one must not fail it.
+   * Called as the run advances, with the whole step list. Never awaited: a slow
+   * sink must not pace the run, and a throwing one must not fail it.
    */
   onProgress?: (progress: ReconcileProgress) => void;
 }
@@ -238,21 +233,40 @@ export class ChapterReconciler {
   constructor(private readonly deps: ReconcileDeps) {}
 
   /**
-   * Report progress, swallowing anything the sink throws.
+   * The pass's step list.
    *
-   * A reconcile pass is minutes of MangaDex calls; losing all of it because a
+   * Built per run, and handed a sink that swallows whatever it throws: a
+   * reconcile pass is minutes of MangaDex calls, and losing all of it because a
    * progress write hit a closed database connection would be a worse failure
-   * than showing a stale number.
+   * than showing a stale row.
    */
-  private say(progress: ReconcileProgress): void {
+  private readonly plan = new ReconcilePlan((steps) => {
     try {
-      this.deps.onProgress?.(progress);
+      this.deps.onProgress?.({ steps });
     } catch (error) {
       this.deps.log.warn({ error }, "reconcile progress sink threw");
     }
+  });
+
+  /** The steps as they stand, for a caller that needs them after a failure. */
+  steps(): ReconcileStep[] {
+    return this.plan.snapshot();
   }
 
   async run(options: ReconcileOptions): Promise<ReconcileReport> {
+    try {
+      return await this.pass(options);
+    } catch (error) {
+      // The plan is marked here rather than by the caller, because this class
+      // owns it and the caller cannot know which step was in flight. Without
+      // this a crashed pass leaves its steps on running and pending forever,
+      // which on the card is indistinguishable from one still working.
+      this.plan.fail(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  private async pass(options: ReconcileOptions): Promise<ReconcileReport> {
     const report: ReconcileReport = {
       dryRun: options.dryRun,
       groups: [],
@@ -274,25 +288,29 @@ export class ChapterReconciler {
     // sweep costs one HTTP call per row it cannot rule out.
     const seenOnMd = new Set<string>();
 
-    this.say({
-      phase: "starting",
-      extension: null,
-      done: 0,
-      total: null,
-      detail: "asking which groups we have uploaded to",
-    });
+    // The plan is declared before any of it runs, so the card shows the whole
+    // queue from the first second rather than one line at a time. Only the
+    // group steps have to wait: which groups exist is a query, so they are
+    // added the moment that query answers.
+    this.plan.start(this.plan.add("groups", "Find which groups we have uploaded to"));
     const groups = await this.groups(options.extensions ?? []);
+    this.plan.finish("groups", groups.length);
+
+    for (const { extension, groupId } of groups) {
+      this.plan.add(`walk:${groupId}`, `Read ${extension}'s chapters on MangaDex`);
+      this.plan.add(`archive:${groupId}`, `Archive ${extension}'s carded and unavailable chapters`);
+      this.plan.add(`adopt:${groupId}`, `Record ${extension}'s untracked chapters`);
+    }
+    const sweep = this.plan.add("sweep", "Check our own rows against MangaDex");
+
     for (const { extension, groupId } of groups) {
       report.groups.push(await this.discoverGroup(extension, groupId, options, report, seenOnMd));
     }
-    if (!options.skipDeleted) await this.sweepUploaded(options, report, seenOnMd);
-    this.say({
-      phase: "done",
-      extension: null,
-      done: report.groups.length,
-      total: groups.length,
-      detail: "finished",
-    });
+    if (options.skipDeleted) {
+      this.plan.skip(sweep, "skipped: --skip-deleted");
+    } else {
+      await this.sweepUploaded(options, report, seenOnMd);
+    }
 
     if (!options.dryRun) {
       await this.deps.audit.record(options.actor, "chapters.reconcile", "mangadex", {
@@ -349,24 +367,30 @@ export class ChapterReconciler {
   ): Promise<ReconcileGroup> {
     // The walk is the slow part by a wide margin: two full paginations at the
     // MangaDex rate limit, ~124 requests and about four minutes on the live
-    // group. Reporting per page is the difference between a progress bar and a
-    // spinner nobody can distinguish from a hang.
+    // group. Reporting per page is the difference between a bar that moves and
+    // a spinner nobody can distinguish from a hang.
+    const walk = `walk:${groupId}`;
+    this.plan.start(walk);
     const { all, served } = await this.deps.md.chapterAvailabilityForGroup(
       groupId,
-      (collected, pass) =>
-        this.say({
-          phase: "walking",
-          extension,
-          done: collected,
-          // MangaDex reports no total up front, so there is nothing honest to
-          // put here until the walk is over.
-          total: null,
-          detail:
-            pass === "all"
-              ? `reading ${extension}'s chapters on MangaDex: ${collected} so far`
-              : `checking which of ${extension}'s chapters MangaDex still serves: ${collected} so far`,
-        }),
+      (collected, total, pass) => {
+        // Two paginations of roughly the same set, shown as one bar: the second
+        // pass re-reads the same chapters to learn which are still served, so
+        // its own count restarting at zero would look like lost progress.
+        // Counting it as the second half keeps the bar going forwards.
+        const half = total === null ? null : total;
+        this.plan.advance(
+          walk,
+          pass === "all" ? collected : (half ?? 0) + collected,
+          half === null ? null : half * 2,
+        );
+        this.plan.note(
+          walk,
+          pass === "all" ? "reading the catalogue" : "checking which are still served",
+        );
+      },
     );
+    this.plan.finish(walk, all.size, `${all.size} chapter(s) on MangaDex`);
 
     const carded: [string, MdEntity][] = [];
     const live: [string, MdEntity][] = [];
@@ -395,24 +419,27 @@ export class ChapterReconciler {
     // chapters — but nothing is counted or written for them. A caller that has
     // asked for one pass should not have the other's numbers reported back as
     // work it is about to do.
+    const archive = `archive:${groupId}`;
     let recorded = 0;
-    if (!options.skipUnavailable) {
+    if (options.skipUnavailable) {
+      this.plan.skip(archive, "skipped: this pass only records untracked chapters");
+    } else {
+      this.plan.start(archive, carded.length);
       let seen = 0;
       for (const [mdChapterId, entity] of carded) {
         seen += 1;
-        this.say({
-          phase: "archiving",
-          extension,
-          done: seen,
-          total: carded.length,
-          detail: `archiving ${extension}'s carded chapters: ${seen} of ${carded.length}`,
-        });
+        this.plan.advance(archive, seen);
         report.unavailableFound += 1;
         if (await this.alreadyArchived(mdChapterId)) continue;
         recorded += 1;
         report.unavailableRecorded += 1;
         if (!options.dryRun) await this.archiveUnavailable(mdChapterId, extension, groupId, entity);
       }
+      this.plan.finish(
+        archive,
+        carded.length,
+        `${recorded} of ${carded.length} not already archived`,
+      );
     }
 
     const adoption = await this.adoptLive(extension, groupId, live, options, report);
@@ -448,20 +475,25 @@ export class ChapterReconciler {
     adoptedWithId: number;
     idRule: ChapterIdUrlRule | null;
   }> {
-    this.say({
-      phase: "adopting",
-      extension,
-      done: 0,
-      total: live.length,
-      detail: `working out which of ${extension}'s ${live.length} live chapter(s) we already have`,
-    });
-    const missing = await this.withoutRows(live.map(([id]) => id));
+    const step = `adopt:${groupId}`;
+    this.plan.start(step, live.length);
+    this.plan.note(step, "working out which we already have");
+    const missing = await this.withoutRows(live.map(([id]) => id), (checked) =>
+      this.plan.advance(step, checked),
+    );
     const candidates = live.filter(([id]) => missing.has(id));
     report.untrackedFound += candidates.length;
 
     const idRule = await this.idRuleFor(extension);
-    if (options.skipAdopt || candidates.length === 0) {
+    if (options.skipAdopt) {
+      this.plan.skip(step, `${candidates.length} untracked, none recorded (--skip-adopt)`);
+      // Still reported: the count is how an operator learns the other button
+      // has work waiting, which is the whole point of asking without writing.
       return { untracked: candidates.length, adopted: 0, adoptedWithId: 0, idRule };
+    }
+    if (candidates.length === 0) {
+      this.plan.finish(step, live.length, "every live chapter already has a row");
+      return { untracked: 0, adopted: 0, adoptedWithId: 0, idRule };
     }
 
     // Skipped on a dry run: they are MangaDex calls and database reads that
@@ -515,20 +547,22 @@ export class ChapterReconciler {
       }
     }
 
-    this.say({
-      phase: "adopting",
-      extension,
-      done: 0,
-      total: rows.length,
-      detail: `recording ${rows.length} untracked chapter(s) of ${extension}`,
-    });
+    // The step restarts against the rows about to be written, because the count
+    // an operator cares about now is "how many recorded", not "how many
+    // checked" -- and those rows land in batches, so the number climbing is the
+    // table below filling up rather than a bar for its own sake.
+    this.plan.start(`adopt:${groupId}`, rows.length);
+    this.plan.note(`adopt:${groupId}`, options.dryRun ? "counting only" : "recording");
+
     // A dry run reports what it would write, as the archiving pass above does.
     // The counts can only be exact for `uploaded_chapters`, whose ids were just
     // checked; `uploaded_ids` may hold some of these already, so its dry-run
     // number is an upper bound and the applied number is the truth.
     let adopted = rows.length;
     let adoptedWithId = ids.length;
-    if (!options.dryRun) {
+    if (options.dryRun) {
+      this.plan.advance(`adopt:${groupId}`, rows.length);
+    } else {
       adopted = 0;
       adoptedWithId = 0;
       for (const batch of chunk(rows, WRITE_BATCH)) {
@@ -537,6 +571,7 @@ export class ChapterReconciler {
           skipDuplicates: true,
         });
         adopted += written.count;
+        this.plan.advance(`adopt:${groupId}`, adopted);
       }
       for (const batch of chunk(ids, WRITE_BATCH)) {
         // skipDuplicates, never upsert: uploaded_ids is insert-only, and the
@@ -550,6 +585,13 @@ export class ChapterReconciler {
       }
     }
 
+    this.plan.finish(
+      `adopt:${groupId}`,
+      adopted,
+      idRule === null
+        ? `${adopted} recorded, but no chapter id could be read from this extension's URLs`
+        : `${adopted} recorded, ${adoptedWithId} with a recovered chapter id`,
+    );
     report.adoptedRecorded += adopted;
     report.idsRecorded += adoptedWithId;
     this.deps.log.info(
@@ -566,8 +608,12 @@ export class ChapterReconciler {
    * have already archived as unavailable or deleted is tracked, and adopting it
    * back into the live table would undo the archiving pass that just ran.
    */
-  private async withoutRows(mdChapterIds: string[]): Promise<Set<string>> {
+  private async withoutRows(
+    mdChapterIds: string[],
+    onBatch?: (checked: number) => void,
+  ): Promise<Set<string>> {
     const missing = new Set(mdChapterIds);
+    let checked = 0;
     for (const batch of chunk(mdChapterIds, READ_BATCH)) {
       const where = { mdChapterId: { in: batch } };
       const select = { mdChapterId: true } as const;
@@ -579,6 +625,8 @@ export class ChapterReconciler {
       for (const rows of [uploaded, unavailable, deleted]) {
         for (const row of rows) missing.delete(row.mdChapterId);
       }
+      checked += batch.length;
+      onBatch?.(checked);
     }
     return missing;
   }
@@ -694,6 +742,16 @@ export class ChapterReconciler {
   ): Promise<void> {
     let cursor: string | undefined;
 
+    // How many rows there are to sweep, so the step has a real denominator.
+    // One cheap count against a number that would otherwise only be known when
+    // the sweep ended, which is exactly when nobody needs it any more.
+    this.plan.start(
+      "sweep",
+      await this.deps.prisma.uploadedChapter.count({
+        where: options.extensions?.length ? { extension: { in: options.extensions } } : {},
+      }),
+    );
+
     for (;;) {
       const rows = await this.deps.prisma.uploadedChapter.findMany({
         where: options.extensions?.length ? { extension: { in: options.extensions } } : {},
@@ -704,13 +762,7 @@ export class ChapterReconciler {
       if (rows.length === 0) break;
       cursor = rows[rows.length - 1]?.id;
       report.scanned += rows.length;
-      this.say({
-        phase: "sweeping",
-        extension: null,
-        done: report.scanned,
-        total: null,
-        detail: `checking our own rows against MangaDex: ${report.scanned} so far`,
-      });
+      this.plan.advance("sweep", report.scanned);
 
       for (const row of rows) {
         if (seenOnMd.has(row.mdChapterId)) {
@@ -744,6 +796,13 @@ export class ChapterReconciler {
         }
       }
     }
+    this.plan.finish(
+      "sweep",
+      report.scanned,
+      report.skippedByGroupWalk > 0
+        ? `${report.skippedByGroupWalk} answered by the group walk, ${report.deletedRecorded} newly deleted`
+        : `${report.deletedRecorded} newly deleted`,
+    );
   }
 
   /**

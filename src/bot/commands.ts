@@ -1398,16 +1398,28 @@ const commands: BotCommand[] = [
         if (status.state === "failed") {
           return { text: `:x: The reconcile pass failed: \`${status.error ?? "no reason given"}\`` };
         }
-        const progress = status.progress;
+        // The queue as it stands, not one status line: the useful answer to
+        // "is it doing anything" is which steps are behind it and which are
+        // still to come.
+        const steps = status.progress?.steps ?? [];
+        const finished = steps.filter((step) => step.state === "done" || step.state === "skipped");
+        const running = steps.find((step) => step.state === "running");
         return {
           text:
             ":hourglass: Still reading MangaDex" +
             (started.started ? "" : " (a pass was already running)") +
-            (progress
-              ? `: ${progress.detail}` +
-                (progress.total !== null ? ` (${progress.done}/${progress.total})` : "")
-              : ".") +
-            "\nIt keeps going without me. Run `/reconcile` again in a minute for the numbers.",
+            (steps.length > 0 ? `: step ${finished.length + 1} of ${steps.length}` : "") +
+            ".\n" +
+            (running
+              ? `• **${running.label}**` +
+                (running.total !== null
+                  ? ` — ${running.done} of ${running.total}`
+                  : running.done > 0
+                    ? ` — ${running.done} so far`
+                    : "") +
+                "\n"
+              : "") +
+            "It keeps going without me. Run `/reconcile` again in a minute for the numbers.",
         };
       }
 

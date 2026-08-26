@@ -4117,6 +4117,53 @@ VIEWS.chapters = (route) => {
  * above this one cannot be previewed row by row afterwards; an archived row
  * has left `uploaded_chapters`.
  */
+/**
+ * A reconcile pass drawn as the queue of steps it actually is.
+ *
+ * The pass declares its whole plan before running any of it, so this is a list
+ * from the first second: what is done, what is going, what is still to come.
+ * That is the difference between a four-minute wait and a four-minute wait you
+ * can read. Each row carries its own count, and the running one fills as it
+ * goes.
+ *
+ * A step with no `total` gets no fill, deliberately. The only number available
+ * mid-step is sometimes "how many so far", and a bar drawn from a denominator
+ * nobody has would be the one dishonest thing on the card.
+ */
+function stepQueue(progress, emptyText) {
+  const steps = (progress && progress.steps) || [];
+  if (steps.length === 0) return el("p", { class: "dim small", text: emptyText });
+
+  return el(
+    "div",
+    { class: "steps" },
+    ...steps.map((step) => {
+      const known = typeof step.total === "number" && step.total > 0;
+      // Clamped: a step can finish on a count above the total MangaDex
+      // predicted, and a bar spilling past its row reads as a rendering bug.
+      const pct = known ? Math.min(100, Math.round((step.done / step.total) * 100)) : 0;
+      const count =
+        step.state === "pending"
+          ? ""
+          : known
+            ? `${step.done} / ${step.total}`
+            : step.done > 0
+              ? String(step.done)
+              : "";
+      return el(
+        "div",
+        { class: `step ${step.state}` },
+        step.state === "running" && known
+          ? el("div", { class: "step-fill", style: { width: `${pct}%` } })
+          : el("span", {}),
+        el("span", { class: "step-label", text: step.label }),
+        el("span", { class: "step-count", text: count }),
+        el("span", { class: "step-note", text: step.note ?? "" }),
+      );
+    }),
+  );
+}
+
 function reconcileCard(archive, reload) {
   if (archive !== "unavailable" && archive !== "deleted" && archive !== "uploaded") {
     return el("span", {});
@@ -4179,7 +4226,15 @@ function reconcileCard(archive, reload) {
         return status.report;
       }
       if (status.state === "failed") {
-        setChildren(output, el("p", { class: "error", text: `The pass failed: ${status.error}` }));
+        // The steps as they stood, so the row that died is visible rather than
+        // the whole queue collapsing into one error line.
+        setChildren(
+          output,
+          el("div", {}, [
+            el("p", { class: "error", text: `The pass failed: ${status.error}` }),
+            stepQueue(status.progress, ""),
+          ]),
+        );
         return null;
       }
       if (status.state === "idle") {
@@ -4203,19 +4258,7 @@ function reconcileCard(archive, reload) {
    */
   const drawProgress = (progress) => {
     checked = null;
-    setChildren(
-      output,
-      el("div", {}, [
-        el("div", { text: progress ? progress.detail : "starting" }),
-        el("div", {
-          class: "dim small",
-          text:
-            (progress && progress.total !== null
-              ? `${progress.done} of ${progress.total}. `
-              : "") + "This takes a few minutes. It keeps going if you leave the page.",
-        }),
-      ]),
-    );
+    setChildren(output, stepQueue(progress, "Working out what there is to do…"));
   };
 
   const render = (report) => {

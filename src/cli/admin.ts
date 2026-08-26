@@ -611,10 +611,20 @@ interface ReconcileReportShape {
   hiddenOnMangadex: string[];
 }
 
+/** Mirrors ReconcileStep in core/md/reconcilePlan.ts. */
+interface ReconcileStepShape {
+  id: string;
+  label: string;
+  state: "pending" | "running" | "done" | "skipped" | "failed";
+  done: number;
+  total: number | null;
+  note: string | null;
+}
+
 /** Mirrors ReconcileRunState in core/md/reconcileRunner.ts. */
 interface ReconcileStatus {
   state: "idle" | "running" | "done" | "failed";
-  progress?: { detail: string; done: number; total: number | null };
+  progress?: { steps: ReconcileStepShape[] };
   report?: ReconcileReportShape;
   error?: string;
 }
@@ -635,35 +645,67 @@ const RECONCILE_POLL_MS = 2000;
 async function follow(): Promise<ReconcileReportShape> {
   const tty = process.stderr.isTTY === true;
   let lastLine = "";
+  /** Steps already reported as finished, so each is announced exactly once. */
+  const announced = new Set<string>();
+
+  const clear = (): void => {
+    if (tty && lastLine) process.stderr.write("\r" + " ".repeat(lastLine.length) + "\r");
+    lastLine = "";
+  };
+
+  /**
+   * Print the steps that have finished since the last poll, then leave the
+   * running one on the line below.
+   *
+   * A finished step scrolls; the running one is rewritten in place on a
+   * terminal. That way the transcript ends up being the plan -- what ran, in
+   * order, with its result -- rather than a megabyte of carriage returns, which
+   * is also what makes it readable when piped into a file.
+   */
+  const draw = (steps: ReconcileStepShape[]): void => {
+    for (const step of steps) {
+      if (step.state === "pending" || step.state === "running") continue;
+      if (announced.has(step.id)) continue;
+      announced.add(step.id);
+      clear();
+      const mark = step.state === "done" ? "✓" : step.state === "skipped" ? "-" : "✗";
+      console.error(`  ${mark} ${step.label}${step.note ? `: ${step.note}` : ""}`);
+    }
+
+    const running = steps.find((step) => step.state === "running");
+    if (!running) return;
+    const line =
+      `  · ${running.label}` +
+      (running.total !== null
+        ? ` (${running.done}/${running.total})`
+        : running.done > 0
+          ? ` (${running.done})`
+          : "") +
+      (running.note ? ` — ${running.note}` : "");
+    if (tty) {
+      process.stderr.write("\r" + " ".repeat(lastLine.length) + "\r" + line);
+      lastLine = line;
+    } else if (line !== lastLine) {
+      console.error(line);
+      lastLine = line;
+    }
+  };
+
   for (;;) {
     const status = await api<ReconcileStatus>("/api/v1/admin/chapters/reconcile");
+    if (status.progress) draw(status.progress.steps);
 
     if (status.state === "done" && status.report) {
-      if (tty && lastLine) process.stderr.write("\r" + " ".repeat(lastLine.length) + "\r");
+      clear();
       return status.report;
     }
     if (status.state === "failed") {
+      clear();
       throw new Error(status.error ?? "the reconcile pass failed");
     }
     if (status.state === "idle") {
+      clear();
       throw new Error("the reconcile pass is not running and left no report");
-    }
-
-    const progress = status.progress;
-    if (progress) {
-      const line =
-        `  ${progress.detail}` +
-        (progress.total !== null ? ` (${progress.done}/${progress.total})` : "");
-      if (tty) {
-        // One rewritten line on a terminal; a plain log everywhere else, so
-        // piping this into a file does not produce a megabyte of carriage
-        // returns.
-        process.stderr.write("\r" + " ".repeat(lastLine.length) + "\r" + line);
-        lastLine = line;
-      } else if (line !== lastLine) {
-        console.error(line);
-        lastLine = line;
-      }
     }
     await new Promise((resolve) => setTimeout(resolve, RECONCILE_POLL_MS));
   }

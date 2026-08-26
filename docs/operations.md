@@ -1559,14 +1559,46 @@ symptom is a Check button that "keeps failing" while the platform is perfectly
 healthy, because a timeout and a fault look identical from the browser.
 
 So `POST /chapters/reconcile` **starts** a pass and answers `202` immediately;
-`GET /chapters/reconcile` reports where it is up to. Everything polls that:
+`GET /chapters/reconcile` reports where it is up to. Everything polls that.
 
-- the dashboard card draws the live phase and count, and picks a running pass
-  back up if you navigate away and return, rather than offering to start a second;
-- `padmin chapters reconcile` prints a progress line and prints the report at the
-  end — Ctrl-C stops the *watching*, not the pass;
-- `/reconcile` in Discord waits ~30s and then reports whatever is known, because
-  an interaction cannot be left open for minutes. Run it again for the numbers.
+### The pass is a queue of steps
+
+A pass declares its whole plan before running any of it, then works down the
+list. That is the difference between a four-minute wait and a four-minute wait
+you can read: at the first poll you already know what is coming, and each row
+ticks `pending → running → done` where you can watch it.
+
+```
+✓ Find which groups we have uploaded to
+· Read mangaplus's chapters on MangaDex          (4820/12440) — reading the catalogue
+  Archive mangaplus's carded and unavailable chapters
+  Record mangaplus's untracked chapters
+  Check our own rows against MangaDex
+```
+
+One step per group per job, plus the sweep. The walk counts both of its
+paginations as one bar — the second re-reads the same chapters to learn which
+are still served, so letting its count restart at zero would look like lost
+progress. Its denominator is MangaDex's own `total` for the query, not a guess;
+where MangaDex gives none (the walk restarting its window past the offset
+ceiling), the row shows a bare count and no bar, because a bar drawn from an
+invented denominator is worse than no bar at all. Adoption reports per write
+batch, so the number climbing *is* the table below filling up.
+
+Each surface renders the same list:
+
+- the dashboard card draws it live, and picks a running pass back up if you
+  navigate away and return rather than offering to start a second;
+- `padmin chapters reconcile` prints each step as it finishes and keeps the
+  running one on a line below — so the transcript ends up being the plan, in
+  order, with each result. Ctrl-C stops the *watching*, not the pass;
+- `/reconcile` in Discord answers "step 3 of 5" with the running one named,
+  because an interaction cannot be left open for minutes. Run it again for the
+  numbers.
+
+A pass that dies marks its running step **failed** and everything after it
+skipped, so a dead pass never reads as one still working — and the card shows
+*which* step died rather than replacing the queue with one error line.
 
 **One pass at a time.** A second start joins the one in flight and answers
 `started: false`; that is not an error, it is the honest answer to a second click

@@ -51,6 +51,16 @@ const OPTIONS = {
   skipUnavailable: false,
 };
 
+/** A pass caught mid-walk, as the stored state records one. */
+const WALK_STEP = {
+  id: "walk:g1",
+  label: "Read mangaplus's chapters on MangaDex",
+  state: "running",
+  done: 2400,
+  total: 12440,
+  note: "reading the catalogue",
+};
+
 describe("running a reconcile pass in the background", () => {
   const log = createLogger("test-runner", "error");
   const audit = { record: async () => {} } as unknown as AuditLog;
@@ -69,6 +79,9 @@ describe("running a reconcile pass in the background", () => {
           if (opts.throws) throw opts.throws;
           return [];
         },
+        // The deletion sweep counts before it starts, so its step has a real
+        // denominator rather than a bar that fills from an unknown total.
+        count: async () => 0,
       },
     } as unknown as PrismaClient;
     const md = {} as unknown as MdExtendedApi;
@@ -152,7 +165,15 @@ describe("running a reconcile pass in the background", () => {
     const failed = await settleTo(runner, ["failed"]);
 
     expect(failed.state).toBe("failed");
-    if (failed.state === "failed") expect(failed.error).toContain("mangadex said no");
+    if (failed.state === "failed") {
+      expect(failed.error).toContain("mangadex said no");
+      // The steps survive the failure, so the card can show WHICH one died
+      // rather than replacing the whole queue with one error line.
+      const steps = failed.progress?.steps ?? [];
+      expect(steps.length).toBeGreaterThan(0);
+      expect(steps.some((step) => step.state === "failed")).toBe(true);
+      expect(steps.every((step) => step.state !== "running")).toBe(true);
+    }
     // And the next attempt is allowed.
     expect((await runner.start(OPTIONS, "tester")).started).toBe(true);
   });
@@ -172,13 +193,17 @@ describe("running a reconcile pass in the background", () => {
         beatAt: stale,
         actor: "a-process-that-died",
         options: OPTIONS,
-        progress: { phase: "walking", extension: "mangaplus", done: 2400, total: null, detail: "" },
+        progress: { steps: [WALK_STEP] },
       }),
     );
 
     const status = await runner.status();
     expect(status.state).toBe("failed");
-    if (status.state === "failed") expect(status.error).toContain("interrupted");
+    if (status.state === "failed") {
+      expect(status.error).toContain("interrupted");
+      // How far it got before it died, which is the only account of it left.
+      expect(status.progress?.steps?.[0]?.done).toBe(2400);
+    }
 
     expect((await runner.start(OPTIONS, "tester")).started).toBe(true);
     await settleTo(runner, ["done"]);
@@ -199,7 +224,7 @@ describe("running a reconcile pass in the background", () => {
         beatAt: new Date().toISOString(),
         actor: "a-long-pass",
         options: OPTIONS,
-        progress: { phase: "walking", extension: "mangaplus", done: 9000, total: null, detail: "" },
+        progress: { steps: [WALK_STEP] },
       }),
     );
 

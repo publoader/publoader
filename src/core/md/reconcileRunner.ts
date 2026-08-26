@@ -44,6 +44,7 @@ import {
 
 const STATE_KEY = "chapters_reconcile_state";
 
+
 /**
  * How long a `running` state may go without moving before a new run may
  * replace it.
@@ -90,6 +91,8 @@ export type ReconcileRunState =
       actor: string;
       options: ReconcileRunOptions;
       error: string;
+      /** The steps as they stood when it died; absent for an abandoned run. */
+      progress?: ReconcileProgress;
     };
 
 export interface ReconcileRunnerDeps {
@@ -124,6 +127,8 @@ export class ReconcileRunner {
         actor: parsed.actor,
         options: parsed.options,
         error: "the run stopped reporting progress; it was most likely interrupted by a restart",
+        // Its last known steps, which say how far it got before it died.
+        progress: parsed.progress,
       };
     }
     return parsed;
@@ -150,13 +155,7 @@ export class ReconcileRunner {
     if (current.state === "running") return { started: false, status: current };
 
     const startedAt = new Date().toISOString();
-    const progress: ReconcileProgress = {
-      phase: "starting",
-      extension: null,
-      done: 0,
-      total: null,
-      detail: "starting",
-    };
+    const progress: ReconcileProgress = { steps: [] };
     const running: ReconcileRunState = {
       state: "running",
       startedAt,
@@ -183,6 +182,20 @@ export class ReconcileRunner {
     // adoption reports per batch and could otherwise write hundreds of rows in
     // a second for a number nobody can read that fast.
     let lastWrite = 0;
+    /**
+     * The step states as of the last write, so a step starting or finishing can
+     * skip the throttle. Counts move constantly and can wait; a row ticking
+     * over is the event an operator is watching for, and delaying those is what
+     * makes a queue look stuck one row from the end. Per execution, never
+     * module-level: two runs sharing it would each suppress the other's events.
+     */
+    let lastStates = "";
+    const changedState = (progress: ReconcileProgress): boolean => {
+      const signature = progress.steps.map((step) => `${step.id}:${step.state}`).join(",");
+      const changed = signature !== lastStates;
+      lastStates = signature;
+      return changed;
+    };
     const beat = (progress: ReconcileProgress, force = false): void => {
       const now = Date.now();
       if (!force && now - lastWrite < 500) return;
@@ -201,14 +214,19 @@ export class ReconcileRunner {
     };
 
     const reconcilerOptions: ReconcileOptions = { ...options, actor };
+    const reconciler = new ChapterReconciler({
+      prisma: this.deps.prisma,
+      md: this.deps.md,
+      log: this.deps.log,
+      audit: this.deps.audit,
+      // Forced whenever a step changes state rather than merely advances: a
+      // step ticking over is the one update nobody should have to wait out the
+      // throttle to see, and there are only ever a handful of them.
+      onProgress: (progress) => beat(progress, changedState(progress)),
+    });
+
     try {
-      const report = await new ChapterReconciler({
-        prisma: this.deps.prisma,
-        md: this.deps.md,
-        log: this.deps.log,
-        audit: this.deps.audit,
-        onProgress: (progress) => beat(progress, progress.phase === "done"),
-      }).run(reconcilerOptions);
+      const report = await reconciler.run(reconcilerOptions);
 
       await this.write({
         state: "done",
@@ -235,6 +253,9 @@ export class ReconcileRunner {
         actor,
         options,
         error: message,
+        // The steps as they stood, so the card can show WHICH one died rather
+        // than replacing the whole queue with one error line.
+        progress: { steps: reconciler.steps() },
       }).catch((writeError: unknown) => {
         this.deps.log.error({ error: writeError }, "could not record the reconcile failure");
       });
