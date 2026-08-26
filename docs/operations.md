@@ -1519,25 +1519,30 @@ above, and closed to api tokens, so it is the dashboard or the break-glass
 `ADMIN_TOKEN`.
 
 **In the dashboard** the card is **Chapters → Reconcile with MangaDex**, on
-every archive it can rebuild. **Check** reads MangaDex and reports the whole
-drift; the button beside it writes only the table you are looking at, and there
-is deliberately no button that writes all three:
+every archive it can rebuild. Each archive gets one button, which rebuilds only
+the table you are looking at; there is deliberately no button that writes all
+three:
 
-| Archive | Button | What it runs | Needs Check first |
-|---|---|---|---|
-| On MangaDex (`uploaded`) | **Track them** | `skipDeleted`, `skipUnavailable` — adoption alone | no |
-| Unavailable, Deleted | **Record them** | `skipAdopt` — the archiving passes alone | yes |
-| Edited | — | the card is not offered; nothing here rebuilds it | — |
+| Archive | Button | What it runs |
+|---|---|---|
+| On MangaDex (`uploaded`) | **Track them** | `skipDeleted`, `skipUnavailable` — adoption alone |
+| Unavailable, Deleted | **Record them** | `skipAdopt` — the archiving passes alone |
+| Edited | — | the card is not offered; nothing here rebuilds it |
 
-**Track them does not need a Check first**, and that asymmetry is deliberate.
-Check is itself a full pass, so requiring it meant walking MangaDex twice to do
-one thing. The discipline it enforces is about writes you cannot inspect
-afterwards: **Record them** *moves* rows out of `uploaded_chapters` and claims
-chapters are gone, so it still asks for a count first. Adoption only ever *adds*
-rows, for chapters MangaDex says our own group published, and every row it adds
-is marked `extra.adopted` and listed on the page below it. Its dialog still
-names any extension whose chapter ids could not be recovered, because those rows
-land visible and still outside `postedChapterIds`.
+**Check** is the same pass with the writing switched off, for when you want the
+numbers first. **Neither button requires it.** Check is itself a full pass, so
+requiring one meant walking MangaDex twice — eight minutes — to do one thing.
+The confirm dialogs carry the warning instead, and they are the stronger guard
+anyway: what makes either button safe is not that a number was on screen first,
+it is that MangaDex is the authority for every row they touch. A chapter is only
+ever recorded as deleted on a 404 from its own endpoint, never because it went
+missing from a listing.
+
+You usually get the count without asking regardless: the card reads the last
+pass's report when it mounts, so the dialogs show real numbers whenever a pass
+has run before. **Track them**'s dialog also names any extension whose chapter
+ids could not be recovered, because those rows land visible and still outside
+`postedChapterIds`.
 
 A single "do everything" button was the obvious shape and the wrong one — it
 meant clicking **Record them** on the deleted archive and silently adding several

@@ -4355,21 +4355,33 @@ function reconcileCard(archive, reload) {
       text: "Record them",
       onclick: async (event) => {
         const button = event.currentTarget;
-        if (!checked) {
-          toast("Check first; nothing should be written before you have seen the count.", false);
-          return;
-        }
-        const moving = checked.unavailableRecorded + checked.deletedRecorded;
+        // Not gated on a prior Check either. Check is itself a full pass, so
+        // requiring it meant walking MangaDex twice to do one thing, and the
+        // walk is four minutes. The dialog carries the warning instead, and it
+        // is the stronger guard anyway: what makes this safe is not that a
+        // number was on screen first, it is that MangaDex is the authority for
+        // every row it moves.
+        const moving = checked ? checked.unavailableRecorded + checked.deletedRecorded : null;
+        const untracked = checked ? (checked.untrackedFound ?? 0) : null;
         if (
           !(await confirmDialog({
             title: "Record what MangaDex changed",
-            lead: `${moving} chapter(s) will move into the unavailable and deleted archives.`,
+            lead:
+              moving === null
+                ? "Every chapter MangaDex has carded, and every one it no longer has, will move " +
+                  "into the archives. Reading MangaDex takes a few minutes."
+                : `${moving} chapter(s) will move into the unavailable and deleted archives.`,
             points: [
               "Nothing is sent to MangaDex; this only corrects our record of it.",
               "Rows that move leave uploaded_chapters, so a chapter lives in exactly one table.",
+              "A chapter is only recorded as deleted when MangaDex 404s its own endpoint, never " +
+                "because it went missing from a listing.",
               "Chapters already archived keep the date they were first recorded.",
-              `The ${checked.untrackedFound ?? 0} untracked live chapter(s) are NOT written here; ` +
-                "that is the Uploaded archive's own button.",
+              untracked === null
+                ? "Untracked live chapters are NOT written here; that is the Uploaded archive's " +
+                  "own button."
+                : `The ${untracked} untracked live chapter(s) are NOT written here; that is the ` +
+                  "Uploaded archive's own button.",
             ],
             confirmLabel: "Move the rows",
           }))
@@ -4422,8 +4434,9 @@ function reconcileCard(archive, reload) {
         class: "dim small",
         text:
           "These tables record what the workers did as they did it, so they describe this " +
-          "platform's own history rather than the catalogue. Check reads MangaDex and reports " +
-          "the whole drift; the button beside it writes only the table you are looking at." +
+          "platform's own history rather than the catalogue. The button beside Check rebuilds " +
+          "only the table you are looking at, straight from MangaDex; Check is the same pass " +
+          "with the writing switched off, for when you want the numbers first." +
           (archive === "uploaded"
             ? " Here that is the live chapters MangaDex has for our groups that we have never " +
               "had a row for -- mostly chapters the previous uploader posted. Tracking them is " +
@@ -4432,6 +4445,15 @@ function reconcileCard(archive, reload) {
               "every run."
             : " Here that is the chapters already carrying an unavailable card and the ones " +
               "MangaDex no longer has."),
+      }),
+      el("p", {
+        class: "dim small",
+        // Said up front because either button may now be the first thing
+        // clicked, and a four-minute wait nobody was warned about is the same
+        // thing as a hang.
+        text:
+          "Any of these reads our groups' whole catalogue on MangaDex, which takes a few " +
+          "minutes. It keeps going if you leave the page, and this card picks it back up.",
       }),
       el(
         "div",

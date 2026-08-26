@@ -352,7 +352,17 @@ function apiRoutes(): { match: RegExp; body: unknown | ((init?: { body?: string 
  */
 let reconcileRunning = false;
 
+/**
+ * Whether the deployment has any past pass to remember.
+ *
+ * False is the ordinary case and means the card can show the last report
+ * without anyone clicking Check; true is a database that has never run one, and
+ * is the only way to see what the buttons say when they have no count yet.
+ */
+let reconcileNeverRun = false;
+
 function reconcileStatus(): unknown {
+  if (reconcileNeverRun) return { ok: true, state: "idle" };
   if (reconcileRunning) {
     return {
       ok: true,
@@ -452,6 +462,7 @@ describe("dashboard chapter views", () => {
   beforeEach(async () => {
     requested = [];
     reconcileRunning = false;
+    reconcileNeverRun = false;
     const html = readFileSync(INDEX_HTML, "utf8");
     // Body only: the <head> would pull app.js and style.css over the network,
     // and the script is evaluated by hand below. The markup is this repo's own
@@ -684,9 +695,9 @@ describe("dashboard chapter views", () => {
 
     it("archives from the unavailable view without adopting into uploaded", async () => {
       await goto("#/chapters/unavailable");
-      click("Check");
-      await settle(20);
 
+      // No Check first, same as Track them. Check is itself a full pass, so
+      // requiring it meant walking MangaDex twice to do one thing.
       click("Record them");
       await settle();
       click("Move the rows");
@@ -696,6 +707,32 @@ describe("dashboard chapter views", () => {
       // skipAdopt: the operator is looking at the unavailable archive, and
       // 5593 new rows in a third table is not what "Record them" promises.
       expect(JSON.parse(writes()[0][1].body ?? "{}")).toEqual({ dryRun: false, skipAdopt: true });
+    });
+
+    it("warns about what it moves even with no count to show yet", async () => {
+      // The dialog is the only guard now that neither button waits for a
+      // Check, so it has to say what "Record them" actually does rather than
+      // rely on a number having been on screen first.
+      reconcileNeverRun = true;
+      await goto("#/chapters/deleted");
+      click("Record them");
+      await settle();
+
+      const dialog = doc.getElementById("modal-body").textContent;
+      expect(dialog).toContain("takes a few minutes");
+      // The irreversible direction, and the one guarantee that makes it safe.
+      expect(dialog).toContain("404s its own endpoint");
+      // And that this is not the button that adopts.
+      expect(dialog).toContain("Uploaded archive's own button");
+    });
+
+    it("still offers Check as a pass that writes nothing", async () => {
+      await goto("#/chapters/unavailable");
+      click("Check");
+      await settle(20);
+
+      expect(writes()).toHaveLength(0);
+      expect(text()).toContain("5593");
     });
 
     it("does not offer either write button on the edited archive, which it cannot rebuild", async () => {
