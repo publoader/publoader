@@ -4252,6 +4252,13 @@ function queueDeferDialog(ids, tasks, done) {
 }
 
 /**
+ * The widest gap `POST /queues/restagger` accepts, mirroring the route's
+ * `max(24 * 3600)`. Kept here so the field cannot offer a value the API will
+ * reject.
+ */
+const MAX_GAP_SECONDS = 24 * 3600;
+
+/**
  * Re-space the whole pending queue to a fixed rate.
  *
  * Not a selection action, which is why it is here rather than beside Run
@@ -4261,7 +4268,13 @@ function queueDeferDialog(ids, tasks, done) {
  * consequence is on screen before the button is pressed.
  */
 function queueRestaggerDialog(kind, tasks, done) {
-  const rate = el("input", { id: "restagger-rate", type: "number", min: "1", max: "600", value: "1" });
+  const gap = el("input", {
+    id: "restagger-gap",
+    type: "number",
+    min: "1",
+    max: String(MAX_GAP_SECONDS),
+    value: "60",
+  });
   const keepPacing = el("input", {
     id: "restagger-persist",
     type: "checkbox",
@@ -4273,28 +4286,28 @@ function queueRestaggerDialog(kind, tasks, done) {
   // worth opening, and a stale count would make it a guess.
   let pending = null;
 
-  // Recomputed as the operator types: "1 a minute" means nothing without "and
-  // therefore the last one goes up in ten hours".
+  // Recomputed as the operator types: "one every 120s" means nothing without
+  // "and therefore the last one goes up in three days".
   const describe = () => {
-    const perMinute = Number(rate.value);
-    if (!Number.isFinite(perMinute) || perMinute < 1) {
-      outcome.textContent = "Enter how many to upload each minute.";
+    const gapSeconds = Number(gap.value);
+    // Integer because the route is `z.coerce.number().int()`: a fractional gap
+    // is a 400 rather than a slower queue, so it is caught before the POST.
+    if (!Number.isInteger(gapSeconds) || gapSeconds < 1 || gapSeconds > MAX_GAP_SECONDS) {
+      outcome.textContent = `Enter a whole gap between uploads, 1 to ${MAX_GAP_SECONDS} seconds.`;
       return null;
     }
-    const gapSeconds = Math.max(1, Math.round(60 / perMinute));
     if (pending === null) {
       outcome.textContent = `One every ${gapSeconds}s. Counting the queue…`;
       return gapSeconds;
     }
-    const spanMinutes = Math.round(((pending - 1) * gapSeconds) / 60);
     outcome.textContent =
       pending === 0
         ? "Nothing is queued, so there is nothing to space out."
-        : `${pending} queued, one every ${gapSeconds}s. The last one becomes claimable in ` +
-          `${spanMinutes >= 120 ? `${Math.round(spanMinutes / 60)} hours` : `${spanMinutes} minutes`}.`;
+        : `${pending} queued, one every ${gapSeconds}s. The last one becomes claimable ` +
+          `${duration((pending - 1) * gapSeconds)}.`;
     return gapSeconds;
   };
-  rate.oninput = describe;
+  gap.oninput = describe;
   describe();
 
   // Quiet and best-effort: a failed count costs the estimate, not the action.
@@ -4318,8 +4331,8 @@ function queueRestaggerDialog(kind, tasks, done) {
           "becomes claimable, so a queue that would upload back to back trickles instead.",
       }),
       row(
-        el("label", { class: "inline", for: "restagger-rate", text: "Uploads per minute" }),
-        rate,
+        el("label", { class: "inline", for: "restagger-gap", text: "Gap between uploads (s)" }),
+        gap,
       ),
       outcome,
       // Ticked by default because the surprising outcome is the other one:
@@ -4343,7 +4356,7 @@ function queueRestaggerDialog(kind, tasks, done) {
           onclick: async (event) => {
             const gapSeconds = describe();
             if (gapSeconds === null) {
-              toast("enter how many to upload each minute", false);
+              toast("enter the gap between uploads, in seconds", false);
               return;
             }
             const result = await act(
