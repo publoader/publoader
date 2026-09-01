@@ -750,6 +750,102 @@ describe.skipIf(!dbReady())("queue management endpoints", () => {
     expect(plain.notBefore.getTime()).toBeLessThanOrEqual(Date.now() + 5_000);
   });
 
+  // ---- per-queue budgets ----
+
+  it("counts each queue's day against its own allowance, not a shared one", async () => {
+    // The property that matters: an upload backlog must not spend the budget an
+    // edit needs. Both queues get rows in the same bucket; each must see only
+    // its own.
+    const DAY = 24 * 3600 * 1000;
+    await task({ kind: "UPLOAD", chapter: { mdMangaId: "m1" } });
+    await task({ kind: "UPLOAD", chapter: { mdMangaId: "m1" } });
+    await task({ kind: "UPLOAD", chapter: { mdMangaId: "m1" } });
+    await task({ kind: "EDIT", chapter: { mdMangaId: "m1" } });
+
+    const uploads = await ctx.uploadTasks.scheduledLoad(DAY, new Date(), undefined, "UPLOAD");
+    const edits = await ctx.uploadTasks.scheduledLoad(DAY, new Date(), undefined, "EDIT");
+
+    const total = (load: { total: Map<number, number> }) =>
+      [...load.total.values()].reduce((a, b) => a + b, 0);
+    expect(total(uploads)).toBe(3);
+    expect(total(edits)).toBe(1);
+
+    // And the default is UPLOAD, so existing callers keep their meaning.
+    expect(total(await ctx.uploadTasks.scheduledLoad(DAY))).toBe(3);
+  });
+
+  it("resolves a queue's schedule from its own override, falling back to the global", async () => {
+    await ctx.settings.setUploadSchedule({ spacingSeconds: 30 });
+    await ctx.settings.setUploadScheduleKind("EDIT", { spacingSeconds: 5 });
+
+    // The queue with an override uses it; every other queue follows the global.
+    expect((await ctx.settings.getUploadSchedule(undefined, "EDIT")).spacingSeconds).toBe(5);
+    expect((await ctx.settings.getUploadSchedule(undefined, "UPLOAD")).spacingSeconds).toBe(30);
+    expect((await ctx.settings.getUploadSchedule(undefined, "DELETE")).spacingSeconds).toBe(30);
+    // Asking without a kind is still the plain global.
+    expect((await ctx.settings.getUploadSchedule()).spacingSeconds).toBe(30);
+
+    // Clearing puts the queue back on the global.
+    await ctx.settings.setUploadScheduleKind("EDIT", null);
+    expect((await ctx.settings.getUploadSchedule(undefined, "EDIT")).spacingSeconds).toBe(30);
+  });
+
+  it("lets an extension override beat a queue's own pace", async () => {
+    // Narrowest wins: pinning one publisher's pace means it for that
+    // publisher's work, whichever queue the work lands in.
+    await ctx.settings.setUploadSchedule({ spacingSeconds: 30 });
+    await ctx.settings.setUploadScheduleKind("EDIT", { spacingSeconds: 5 });
+    await ctx.settings.setUploadScheduleOverride("comikey", { spacingSeconds: 900 });
+
+    expect((await ctx.settings.getUploadSchedule("comikey", "EDIT")).spacingSeconds).toBe(900);
+    expect((await ctx.settings.getUploadSchedule("mangaplus", "EDIT")).spacingSeconds).toBe(5);
+  });
+
+  it("edits one queue's pace over the API and leaves the others alone", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/upload-schedule/kinds/DELETE",
+      headers: root,
+      payload: { spacingSeconds: 120 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ kind: "DELETE", cleared: false });
+    expect(res.json().effective.spacingSeconds).toBe(120);
+
+    const read = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/upload-schedule",
+      headers: root,
+    });
+    expect(read.json().kinds).toEqual({ DELETE: { spacingSeconds: 120 } });
+    expect(read.json().queueKinds).toContain("RESTORE");
+
+    // An empty body clears rather than pinning the numbers on screen.
+    const cleared = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/upload-schedule/kinds/DELETE",
+      headers: root,
+      payload: {},
+    });
+    expect(cleared.json()).toMatchObject({ cleared: true });
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/upload-schedule",
+      headers: root,
+    });
+    expect(after.json().kinds).toEqual({});
+  });
+
+  it("refuses a queue name that is not a queue", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/upload-schedule/kinds/NOPE",
+      headers: root,
+      payload: { spacingSeconds: 10 },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
   // ---- restagger ----
 
   it("gives every pending row its own time, in the order the queue already had", async () => {

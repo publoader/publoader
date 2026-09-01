@@ -52,6 +52,10 @@ const SCHEDULE = {
   // A different extension from the prioritised one, so a box read off the
   // wrong list is visible rather than accidentally right.
   paused: ["comikey"],
+  // One queue pinned and the rest following the global, so a box seeded from
+  // the wrong place shows up as a number where a placeholder belongs.
+  queueKinds: ["UPLOAD", "EDIT", "DELETE", "UNAVAILABLE", "RESTORE"],
+  kinds: { EDIT: { spacingSeconds: 5 } },
 };
 
 /** Swapped per test so the scope gate can be exercised. */
@@ -152,9 +156,27 @@ function cardByTitle(title: string): any {
 const buttonLabelled = (root: any, text: string): any =>
   [...root.querySelectorAll("button")].find((b: any) => b.textContent === text);
 
-/** The card's three number inputs, in the order they are drawn. */
+/**
+ * The card's global schedule inputs, in the order they are drawn.
+ *
+ * The per-queue rows below them are number inputs too, so they are excluded by
+ * id: those are a different setting with a different fallback (blank follows
+ * the global), and folding them in here would make every assertion about the
+ * global depend on how many queues exist.
+ */
 const numbers = (card: any): string[] =>
-  [...card.querySelectorAll('input[type="number"]')].map((i: any) => i.value);
+  [...card.querySelectorAll('input[type="number"]')]
+    .filter((i: any) => !String(i.id).startsWith("schedule-kind-"))
+    .map((i: any) => i.value);
+
+/** One box per queue, keyed by queue name. */
+const kindBoxes = (card: any): Record<string, any> =>
+  Object.fromEntries(
+    [...card.querySelectorAll('input[id^="schedule-kind-"]')].map((i: any) => [
+      String(i.id).replace("schedule-kind-", ""),
+      i,
+    ]),
+  );
 
 const scheduleWrites = (): { path: string; method: string; body: any }[] =>
   calls.filter((c) => c.method === "POST" && c.path.includes("/upload-schedule"));
@@ -247,6 +269,62 @@ describe("release pacing is editable from the dashboard", () => {
     expect(card.textContent).toContain("Following the global");
     expect(buttonLabelled(card, "Follow global")).toBeUndefined();
     expect(buttonLabelled(card, "Override")).toBeTruthy();
+  });
+
+  it("gives every queue its own pace box, blank when it follows the global", async () => {
+    await goto("#/extensions");
+    const boxes = kindBoxes(cardByTitle("Release pacing"));
+
+    // One per queue, so none of the five is silently stuck on another's pace.
+    expect(Object.keys(boxes).sort()).toEqual([
+      "DELETE",
+      "EDIT",
+      "RESTORE",
+      "UNAVAILABLE",
+      "UPLOAD",
+    ]);
+    // The pinned one shows its own number; the rest are blank and say so,
+    // rather than showing the global's number as though they were pinned to it.
+    expect(boxes.EDIT.value).toBe("5");
+    expect(boxes.UPLOAD.value).toBe("");
+    expect(boxes.UPLOAD.placeholder).toBe("global");
+  });
+
+  it("saves one queue's pace without touching the others", async () => {
+    await goto("#/extensions");
+    const card = cardByTitle("Release pacing");
+    const boxes = kindBoxes(card);
+
+    calls = [];
+    boxes.DELETE.value = "120";
+    // The Set button in the DELETE row, not the global Save.
+    const setButton = [...boxes.DELETE.parentElement.querySelectorAll("button")].find(
+      (b: any) => b.textContent === "Set",
+    );
+    setButton.click();
+    await settle();
+
+    const write = scheduleWrites()[0];
+    expect(write?.path).toContain("/upload-schedule/kinds/DELETE");
+    expect(write?.body).toEqual({ spacingSeconds: 120 });
+  });
+
+  it("clears a queue's pace with an empty body rather than writing 0", async () => {
+    // 0 is a real value meaning "do not pace" and is NOT the same as following
+    // the global, so an emptied box must clear rather than pin zero.
+    await goto("#/extensions");
+    const card = cardByTitle("Release pacing");
+    const boxes = kindBoxes(card);
+
+    calls = [];
+    boxes.EDIT.value = "";
+    const setButton = [...boxes.EDIT.parentElement.querySelectorAll("button")].find(
+      (b: any) => b.textContent === "Set",
+    );
+    setButton.click();
+    await settle();
+
+    expect(scheduleWrites()[0]?.body).toEqual({});
   });
 
   it("hides the card from a credential that cannot read settings", async () => {
