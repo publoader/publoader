@@ -561,6 +561,12 @@ export class UploadTaskStore {
      * every extension's work counts against one shared pool.
      */
     extension?: string,
+    /**
+     * Which queue's allowance is being counted. The five queues do not share
+     * one: they reach MangaDex through different endpoints at different costs,
+     * so an upload backlog must not spend the budget an edit needs.
+     */
+    kind: UploadTaskKind = "UPLOAD",
   ): Promise<ScheduledLoad> {
     const fromBucket = Math.floor(now.getTime() / intervalMs);
     const rows = await this.prisma.$queryRaw<{ bucket: bigint; manga: string; n: bigint }[]>(
@@ -569,7 +575,7 @@ export class UploadTaskStore {
                coalesce(chapter->>'mdMangaId', chapter->>'mangaId', '') AS manga,
                count(*)::bigint AS n
         FROM upload_tasks
-        WHERE kind = 'UPLOAD' AND state IN ('PENDING', 'LEASED', 'DONE')
+        WHERE kind = ${kind}::"UploadTaskKind" AND state IN ('PENDING', 'LEASED', 'DONE')
           AND not_before >= to_timestamp(${(fromBucket * intervalMs) / 1000})
           ${extension === undefined ? Prisma.empty : Prisma.sql`AND chapter->>'extensionName' = ${extension}`}
         GROUP BY 1, 2

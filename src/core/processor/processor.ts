@@ -617,11 +617,19 @@ export class RunProcessor {
       // series at a time. Queued together once the loop has seen them all.
       pendingUploads.push(...decision.toUpload);
       for (const edit of decision.toEdit) {
-        await this.tasks.enqueue("EDIT", edit.mdChapterId, {
-          ...edit.chapter,
-          oldInfo: edit.oldInfo,
-          payload: edit.payload,
-        });
+        await this.tasks.enqueue(
+          "EDIT",
+          edit.mdChapterId,
+          {
+            ...edit.chapter,
+            oldInfo: edit.oldInfo,
+            payload: edit.payload,
+          },
+          // The EDIT queue's own pace, read per kind: an edit is one PUT and
+          // has no reason to crawl at the rate an image upload needs, nor to
+          // spend the allowance the upload queue is counting.
+          { spacingSeconds: await this.spacingFor("EDIT", run.extension) },
+        );
       }
       await this.enqueueRemovals(
         decision.toRemove,
@@ -723,14 +731,14 @@ export class RunProcessor {
       // the two can never disagree about which pool is being filled.
       const scope = spread ? await this.settings.getUploadBudgetScope() : null;
       const budgetOf = scope === "extension" ? run.extension : undefined;
-      const schedule = spread ? await this.settings.getUploadSchedule(budgetOf) : null;
+      const schedule = spread ? await this.settings.getUploadSchedule(budgetOf, "UPLOAD") : null;
 
       if (schedule === null) {
         // Not spread, but still paced. "Immediate" means this run's chapters
         // are not held back for days by the per-day cap; it does not mean the
         // uploader should fire them off back to back, which is the one thing
         // `spacingSeconds` exists to stop. Each row queues behind the tail.
-        const { spacingSeconds } = await this.settings.getUploadSchedule(run.extension);
+        const spacingSeconds = await this.spacingFor("UPLOAD", run.extension);
         for (const chapter of pendingUploads) {
           // An explicit `notBefore` beats the pacing tail inside `enqueue`, so
           // this is what "ignore the queue" is: no chaining behind anyone.
@@ -760,7 +768,7 @@ export class RunProcessor {
           // What every other extension and every earlier run already put in
           // each bucket, so this run fills what is left rather than starting
           // the calendar over.
-          await this.tasks.scheduledLoad(intervalMsOf(schedule), new Date(), budgetOf),
+          await this.tasks.scheduledLoad(intervalMsOf(schedule), new Date(), budgetOf, "UPLOAD"),
         );
         const shape = summariseSchedule(scheduled);
 
@@ -1101,6 +1109,20 @@ export class RunProcessor {
    * or the "replace with an unavailable card" queue, and drop them from the
    * uploaded bookkeeping so nothing re-queues them later.
    */
+  /**
+   * One queue's gap between consecutive tasks.
+   *
+   * Per kind because the five queues are not interchangeable work: an UPLOAD
+   * opens a MangaDex session and pushes images, an UNAVAILABLE is a single PUT.
+   * Pacing them from one number makes the cheap queues crawl at the expensive
+   * one's rate, or drags the expensive one up to theirs. Each kind reads its
+   * own setting and, in `enqueue`, chains onto its own queue's tail, so a
+   * 2,000-chapter upload backlog cannot push a handful of edits behind it.
+   */
+  private async spacingFor(kind: UploadTaskKind, extension: string): Promise<number> {
+    return (await this.settings.getUploadSchedule(extension, kind)).spacingSeconds;
+  }
+
   private async enqueueRemovals(
     mdChapters: MdChapter[],
     mdMangaId: string,
@@ -1113,11 +1135,16 @@ export class RunProcessor {
     const kind: UploadTaskKind = mode === "delete" ? "DELETE" : "UNAVAILABLE";
     const mangaName = this.mangaNames.get(mdMangaId) ?? null;
 
+    // Read once for the batch rather than per chapter: a removal pass can be
+    // hundreds of rows and the setting cannot change underneath one loop.
+    const spacingSeconds = await this.spacingFor(kind, extension);
+
     for (const mdChapter of mdChapters) {
       await this.tasks.enqueue(
         kind,
         mdChapter.id,
         chapterFromMdChapter(mdChapter, { mdMangaId, extension, groupId, mangaName, mode }),
+        { spacingSeconds },
       );
       await this.prisma.uploadedChapter.deleteMany({ where: { mdChapterId: mdChapter.id } });
     }

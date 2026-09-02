@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { Prisma } from "@prisma/client";
+import { Prisma, type UploadTaskKind } from "@prisma/client";
 import { z } from "zod";
+import { UPLOAD_TASK_KINDS } from "../../store/uploadTasks.js";
 import type { AppContext } from "../context.js";
 import { adminAuthHook, requireScope } from "../auth.js";
 import { hasScope } from "../scopes.js";
@@ -811,6 +812,11 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AppContext): void
         global: await ctx.settings.getUploadSchedule(),
         overrides: await ctx.settings.getUploadScheduleOverrides(),
         defaults: DEFAULT_UPLOAD_SCHEDULE,
+        // Per queue, because the five do not share an allowance: an upload
+        // opens a MangaDex session and pushes images, an unavailable is one
+        // PUT, and pacing them from one number makes the cheap queues crawl.
+        kinds: await ctx.settings.getUploadScheduleKinds(),
+        queueKinds: UPLOAD_TASK_KINDS,
         scope: await ctx.settings.getUploadBudgetScope(),
         scopes: UPLOAD_BUDGET_SCOPES,
         priority: await ctx.settings.getUploadPriorityExtensions(),
@@ -938,6 +944,32 @@ export function registerAdminRoutes(app: FastifyInstance, ctx: AppContext): void
         const applied = await ctx.settings.getUploadSchedule();
         await ctx.audit.record(actor(req), "upload_schedule.set", "global", applied);
         return { ok: true, global: applied };
+      },
+    );
+
+    /**
+     * One queue's own pace; an empty body clears it back to the global.
+     *
+     * Two segments rather than one so it cannot be mistaken for an extension
+     * named "UPLOAD", and registered before `:name` for the same reason.
+     */
+    scope.post(
+      "/api/v1/admin/upload-schedule/kinds/:kind",
+      { preHandler: requireScope("settings:write") },
+      async (req, reply) => {
+        const { kind } = req.params as { kind: string };
+        if (!(UPLOAD_TASK_KINDS as readonly string[]).includes(kind)) {
+          return reply.code(400).send({ error: `unknown queue: ${kind}` });
+        }
+        const body = uploadScheduleBody.parse(req.body ?? {});
+        const clearing = Object.keys(body).length === 0;
+        await ctx.settings.setUploadScheduleKind(kind as UploadTaskKind, clearing ? null : body);
+        const applied = await ctx.settings.getUploadSchedule(undefined, kind as UploadTaskKind);
+        await ctx.audit.record(actor(req), "upload_schedule.set", `kind:${kind}`, {
+          cleared: clearing,
+          ...applied,
+        });
+        return { ok: true, kind, cleared: clearing, effective: applied };
       },
     );
 

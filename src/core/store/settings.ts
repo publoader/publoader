@@ -1,4 +1,4 @@
-import type { Prisma, PrismaClient, ScheduleEntry } from "@prisma/client";
+import type { Prisma, PrismaClient, ScheduleEntry, UploadTaskKind } from "@prisma/client";
 import type { ScheduleSlot } from "../../contracts/manifest.js";
 
 /** A stored slot: the contract shape plus the two things only a row has. */
@@ -48,6 +48,7 @@ const WEBHOOK_SUCCESSES_KEY = "webhook_upload_successes";
 const GITHUB_AUTO_SYNC_KEY = "github_auto_sync";
 const UPLOAD_SCHEDULE_KEY = "upload_schedule";
 const UPLOAD_SCHEDULE_OVERRIDES_KEY = "upload_schedule_overrides";
+const UPLOAD_SCHEDULE_KINDS_KEY = "upload_schedule_kinds";
 const UPLOAD_BUDGET_SCOPE_KEY = "upload_budget_scope";
 const UPLOAD_PRIORITY_KEY = "upload_priority_extensions";
 const UPLOAD_PAUSED_KEY = "upload_paused_extensions";
@@ -385,15 +386,53 @@ export class SettingsStore {
    * throttle: an extension can slow its own releases without restating the
    * limits it was already happy with.
    */
-  async getUploadSchedule(extension?: string): Promise<UploadSchedule> {
-    const [globalRaw, overridesRaw] = await Promise.all([
+  /**
+   * The schedule for one queue, optionally narrowed to one extension.
+   *
+   * `kind` is what stops the five queues sharing an allowance. They reach
+   * MangaDex through different endpoints with different costs -- an UPLOAD
+   * opens a session and pushes images, an UNAVAILABLE is one PUT -- so pacing
+   * them from one number means the cheap queues either crawl at the expensive
+   * one's rate or drag it up to theirs. Each kind resolves its own settings and
+   * (in `UploadTaskStore`) counts only its own rows, so a 2,000-chapter upload
+   * backlog cannot hold up a handful of edits behind it.
+   *
+   * Layered narrowest-wins: defaults, the global, that kind, then the
+   * extension. Kind sits under extension deliberately -- an operator pinning
+   * one publisher's pace means it for that publisher's work, whichever queue it
+   * lands in -- and unset kinds simply follow the global, so nothing changes
+   * for anyone who never opens the per-queue controls.
+   */
+  async getUploadSchedule(extension?: string, kind?: UploadTaskKind): Promise<UploadSchedule> {
+    const [globalRaw, kindsRaw, overridesRaw] = await Promise.all([
       this.getSetting(UPLOAD_SCHEDULE_KEY),
+      kind ? this.getSetting(UPLOAD_SCHEDULE_KINDS_KEY) : Promise.resolve(null),
       extension ? this.getSetting(UPLOAD_SCHEDULE_OVERRIDES_KEY) : Promise.resolve(null),
     ]);
-    const base = { ...DEFAULT_UPLOAD_SCHEDULE, ...parseUploadSchedule(globalRaw) };
+    let base = { ...DEFAULT_UPLOAD_SCHEDULE, ...parseUploadSchedule(globalRaw) };
+    if (kind) base = { ...base, ...parseUploadSchedule(parseRecord(kindsRaw)[kind]) };
     if (!extension) return clampUploadSchedule(base);
     const overrides = parseRecord(overridesRaw);
     return clampUploadSchedule({ ...base, ...parseUploadSchedule(overrides[extension]) });
+  }
+
+  /** Every per-queue override, for the editor to render. */
+  async getUploadScheduleKinds(): Promise<Record<string, Partial<UploadSchedule>>> {
+    const parsed = parseRecord(await this.getSetting(UPLOAD_SCHEDULE_KINDS_KEY));
+    const out: Record<string, Partial<UploadSchedule>> = {};
+    for (const [name, value] of Object.entries(parsed)) out[name] = parseUploadSchedule(value);
+    return out;
+  }
+
+  /** `null` removes the override, so that queue follows the global again. */
+  async setUploadScheduleKind(
+    kind: UploadTaskKind,
+    values: Partial<UploadSchedule> | null,
+  ): Promise<void> {
+    const kinds = await this.getUploadScheduleKinds();
+    if (values === null) delete kinds[kind];
+    else kinds[kind] = values;
+    await this.setSetting(UPLOAD_SCHEDULE_KINDS_KEY, JSON.stringify(kinds));
   }
 
   async setUploadSchedule(values: Partial<UploadSchedule>): Promise<void> {

@@ -8226,6 +8226,48 @@ function uploadScheduleControls(data, resource) {
       { refresh: [resource] },
     );
   };
+  // One row per queue. The five reach MangaDex through different endpoints at
+  // different costs, so a single pace either makes the cheap queues crawl or
+  // drags the expensive one up; each keeps its own number and counts only its
+  // own rows. Blank means "follow the global", which is why the input is
+  // seeded from the stored override rather than the effective value: seeding
+  // it from the effective one would make every queue look pinned and saving
+  // the form would pin them for real.
+  const kindOverrides = data.kinds ?? {};
+  const kindRows = (data.queueKinds ?? []).map((kind) => {
+    const stored = kindOverrides[kind] ?? {};
+    const gap = el("input", {
+      id: `schedule-kind-${kind}`,
+      type: "number",
+      min: "0",
+      max: "86400",
+      step: "1",
+      value: stored.spacingSeconds === undefined ? "" : String(stored.spacingSeconds),
+      placeholder: "global",
+      "aria-label": `Seconds between consecutive ${kind} tasks, blank to follow the global`,
+    });
+    const save = (body) =>
+      act(
+        "upload-schedule.kind",
+        () =>
+          api(`/upload-schedule/kinds/${encodeURIComponent(kind)}`, { method: "POST", body }),
+        { refresh: [resource] },
+      );
+    return row(
+      el("label", { class: "inline", for: `schedule-kind-${kind}`, text: kind }),
+      gap,
+      gatedButton("settings:write", {
+        text: "Set",
+        onclick: () => {
+          // An empty box clears rather than writing 0: 0 is a real value
+          // meaning "do not pace", and is not the same as following the global.
+          const raw = gap.value.trim();
+          void save(raw === "" ? {} : { spacingSeconds: Number(raw) });
+        },
+      }),
+    );
+  });
+
   const priority = new Set(data.priority ?? []);
   // Every extension the platform knows, not just the ones already prioritised,
   // so turning priority ON is a click rather than knowing a name to type.
@@ -8320,6 +8362,14 @@ function uploadScheduleControls(data, resource) {
         "Gap between uploads applies everywhere work becomes claimable: a spread day is spaced " +
         "across it, and anything newly queued is dated behind the queue's tail rather than on top " +
         "of it. 0 paces only a day that is full.",
+    }),
+    ...kindRows,
+    el("p", {
+      class: "dim small",
+      text:
+        "Each queue has its own pace and counts only its own rows, so an upload backlog never " +
+        "spends what an edit needs. Blank follows the global above; a number overrides it for " +
+        "that queue alone.",
     }),
     row(el("span", { class: "inline", text: "Priority" }), ...priorityBoxes),
     el("p", {
